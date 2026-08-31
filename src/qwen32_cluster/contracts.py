@@ -15,6 +15,10 @@ EXPECTED_RING_HOSTS = (
     ("127.0.0.1", ("169.254.217.74",)),
     ("kelly@169.254.82.82", ("169.254.82.82",)),
 )
+EXPECTED_GUARDRAILS = ((0, 10844792422), (1, 12133282611))
+CANONICAL_RING_HOSTFILE = "/Users/Shared/mlx-cluster/hosts.json"
+CANONICAL_RING_STARTING_PORT = 33323
+CANONICAL_DEPLOYMENT_PORTS = (18081, 18080, 8080)
 
 
 class RunStatus(str, Enum):
@@ -155,6 +159,8 @@ class RingHost:
         if not isinstance(self.ips, tuple) or not self.ips:
             raise ValueError("ring host ips must be a non-empty tuple")
         for value in self.ips:
+            if not isinstance(value, str) or not value:
+                raise ValueError("ring host ips must contain non-empty strings")
             try:
                 address = ipaddress.ip_address(value)
             except ValueError as exc:
@@ -184,7 +190,11 @@ class Ring:
         _require_string(self.hostfile, "ring hostfile")
         if not Path(self.hostfile).is_absolute():
             raise ValueError("ring hostfile must be an absolute path")
+        if self.hostfile != CANONICAL_RING_HOSTFILE:
+            raise ValueError(f"ring hostfile must be {CANONICAL_RING_HOSTFILE}")
         _validate_port(self.starting_port, "ring starting_port")
+        if self.starting_port != CANONICAL_RING_STARTING_PORT:
+            raise ValueError(f"ring starting_port must be {CANONICAL_RING_STARTING_PORT}")
         actual = tuple((host.ssh, host.ips) for host in self.hosts)
         if actual != EXPECTED_RING_HOSTS:
             raise ValueError("ring hosts and ips must match the fixed M3/M4 order")
@@ -223,6 +233,10 @@ class DeploymentPorts:
         )
         if len(set(values)) != len(values):
             raise ValueError("deployment ports must be distinct")
+        if values != CANONICAL_DEPLOYMENT_PORTS:
+            raise ValueError(
+                "deployment ports must be internal=18081, canary=18080, public=8080"
+            )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> DeploymentPorts:
@@ -249,6 +263,9 @@ class ClusterConfig:
         actual = tuple((host.rank, host.name, host.ssh, host.thunderbolt_ip) for host in self.hosts)
         if actual != expected:
             raise ValueError("cluster hosts must match the fixed M3/M4 topology")
+        guardrails = tuple((host.rank, host.mlx_peak_guardrail_bytes) for host in self.hosts)
+        if guardrails != EXPECTED_GUARDRAILS:
+            raise ValueError("cluster guardrails must match the fixed per-rank safety policy")
         ring_endpoints = tuple((host.ssh, host.ips[0]) for host in self.ring.hosts)
         control_endpoints = tuple((host.ssh, host.thunderbolt_ip) for host in self.hosts)
         if ring_endpoints != control_endpoints:

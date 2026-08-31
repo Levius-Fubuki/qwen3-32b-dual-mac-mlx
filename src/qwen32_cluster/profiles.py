@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, overload
+from typing import Any
 
 from .contracts import _load_json, _require_exact_keys, _require_int, _require_string, canonical_json
 
@@ -132,15 +132,9 @@ class ProfilesConfig(Mapping[str, Profile]):
     def __len__(self) -> int:
         return len(self.profiles)
 
-    @overload
-    def __getitem__(self, key: str) -> Profile: ...
-
-    @overload
-    def __getitem__(self, key: int) -> Profile: ...
-
-    def __getitem__(self, key: str | int) -> Profile:
-        if isinstance(key, int):
-            return self.profiles[key]
+    def __getitem__(self, key: str) -> Profile:
+        if not isinstance(key, str):
+            raise KeyError(key)
         for profile in self.profiles:
             if profile.name == key:
                 return profile

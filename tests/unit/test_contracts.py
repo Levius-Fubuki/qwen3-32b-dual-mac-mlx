@@ -93,6 +93,20 @@ def test_cluster_host_parser_rejects_integer_form_thunderbolt_ip() -> None:
         module.ClusterHost.from_dict(payload)
 
 
+def test_ring_host_rejects_integer_form_ip() -> None:
+    module = contracts()
+    numeric_ip = int(ipaddress.IPv4Address("169.254.217.74"))
+    with pytest.raises(ValueError, match="ring host ips must contain non-empty strings"):
+        module.RingHost("127.0.0.1", (numeric_ip,))
+
+
+def test_ring_host_parser_rejects_integer_form_ip() -> None:
+    module = contracts()
+    numeric_ip = int(ipaddress.IPv4Address("169.254.217.74"))
+    with pytest.raises(ValueError, match="ring host ips must contain non-empty strings"):
+        module.RingHost.from_dict({"ssh": "127.0.0.1", "ips": [numeric_ip]})
+
+
 def test_cluster_config_round_trips_canonical_json(tmp_path: Path) -> None:
     module = contracts()
     path = tmp_path / "cluster.json"
@@ -129,6 +143,41 @@ def test_cluster_rejects_unknown_fields(tmp_path: Path) -> None:
     path = tmp_path / "cluster.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="unexpected"):
+        module.load_cluster(path)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["hosts"][0].update(mlx_peak_guardrail_bytes=1),
+        lambda value: value["hosts"][1].update(mlx_peak_guardrail_bytes=2**60),
+        lambda value: value["ring"].update(hostfile="/tmp/alternate-hosts.json"),
+        lambda value: value["ring"].update(starting_port=1024),
+        lambda value: value["ring"].update(starting_port=33324),
+        lambda value: value["deployment_ports"].update(internal=18082),
+        lambda value: value["deployment_ports"].update(canary=18079),
+        lambda value: value["deployment_ports"].update(public=8081),
+        lambda value: value["deployment_ports"].update(public=18081),
+    ],
+    ids=[
+        "arbitrary-rank0-guardrail",
+        "high-rank1-guardrail",
+        "alternate-hostfile",
+        "low-ring-port",
+        "wrong-ring-port",
+        "altered-internal-port",
+        "altered-canary-port",
+        "altered-public-port",
+        "colliding-deployment-port",
+    ],
+)
+def test_cluster_rejects_noncanonical_safety_inputs(tmp_path: Path, mutate) -> None:
+    module = contracts()
+    payload = valid_cluster_payload()
+    mutate(payload)
+    path = tmp_path / "cluster.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError):
         module.load_cluster(path)
 
 

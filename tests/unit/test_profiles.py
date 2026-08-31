@@ -40,6 +40,15 @@ def test_repository_profiles_match_the_canonical_matrix() -> None:
     }
 
 
+@pytest.mark.parametrize("key", [0, 1, True, False])
+def test_profiles_mapping_rejects_sequence_and_bool_keys(key) -> None:
+    module = profiles()
+    config = module.load_profiles(Path(__file__).parents[2] / "config" / "profiles.json")
+    with pytest.raises(KeyError):
+        config[key]
+    assert config.profiles[0].name == "balanced-4bit"
+
+
 def test_profile_is_frozen_and_stage_order_is_preserved() -> None:
     module = profiles()
     profile = module.Profile("quality-4bit", 4, (36, 28), 256)

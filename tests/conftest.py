@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -26,11 +24,10 @@ def _valid_hostfile(raw_path: str | None) -> bool:
     if not raw_path:
         return False
     try:
-        payload = json.loads(Path(raw_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = _load_json(raw_path)
+    except (OSError, TypeError, ValueError):
         return False
-    hosts = payload.get("hosts") if isinstance(payload, dict) else payload
-    return hosts == EXPECTED_RING_HOSTS
+    return payload == {"backend": "ring", "hosts": EXPECTED_RING_HOSTS}
 
 
 def _canonical_profile_file(raw_path: str | None) -> bool:
