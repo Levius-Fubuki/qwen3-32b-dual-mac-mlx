@@ -5,9 +5,8 @@ import hashlib
 import json
 import os
 import time
-import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import mlx.core as mx
 import numpy as np
@@ -27,6 +26,51 @@ CASES = (
     "sequence_corruption",
 )
 NEGATIVE_MARKER_TIMEOUT_SECONDS = 5
+
+
+class DistributedCallTrace:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+        self._call: str | None = None
+        distributed = mx.distributed
+        self._recv_like = distributed.recv_like
+        self._send = distributed.send
+        self._all_gather = distributed.all_gather
+
+        def recv_like(value, source, *args, **kwargs):
+            self._record("recv", peer=source)
+            return self._recv_like(value, source, *args, **kwargs)
+
+        def send(value, destination, *args, **kwargs):
+            self._record("send", peer=destination)
+            return self._send(value, destination, *args, **kwargs)
+
+        def all_gather(value, *args, **kwargs):
+            self._record("all_gather")
+            return self._all_gather(value, *args, **kwargs)
+
+        distributed.recv_like = recv_like
+        distributed.send = send
+        distributed.all_gather = all_gather
+
+    def _record(self, event: str, **details: Any) -> None:
+        if self._call is None:
+            raise RuntimeError(f"distributed {event} constructed outside a traced call")
+        self.events.append({"call": self._call, "event": event} | details)
+
+    def construct(self, call: str, function: Callable[[], mx.array]) -> mx.array:
+        if self._call is not None:
+            raise RuntimeError("nested traced calls are not supported")
+        self._call = call
+        try:
+            return function()
+        finally:
+            self._call = None
+
+    def eval_complete(self, call: str, target: str) -> None:
+        self.events.append(
+            {"call": call, "event": "eval_complete", "target": target}
+        )
 
 
 def _model_config() -> dict[str, Any]:
@@ -83,33 +127,51 @@ def _cache_record(
     }
 
 
-def _base_result(rank: int, sequence: list[str]) -> dict[str, Any]:
+def _base_result(
+    case: str,
+    group,
+    pipeline: PipelineModel,
+    trace: DistributedCallTrace,
+) -> dict[str, Any]:
+    local_layers = [
+        index
+        for index, layer in enumerate(pipeline.model.layers)
+        if layer is not None
+    ]
     return {
-        "rank": rank,
-        "world_size": 2,
+        "case": case,
+        "rank": group.rank(),
+        "world_size": group.size(),
         "status": "ok",
         "exit_code": 0,
         "error": None,
-        "sequence": sequence,
-        "local_layers": [1] if rank == 0 else [0],
-        "batch_size": 2,
+        "events": trace.events,
+        "local_layers": local_layers,
+        "partition": {
+            "start": pipeline.model.start_idx,
+            "end": pipeline.model.end_idx,
+        },
     }
 
 
 def _forward_case(
-    rank: int,
+    case: str,
+    group,
     reference: UpstreamModel,
     pipeline: PipelineModel,
-    sequence: list[str],
+    trace: DistributedCallTrace,
 ) -> dict[str, Any]:
     tokens = mx.array([[1, 7, 3, 9], [2, 6, 4, 8]])
     reference_logits = reference(tokens)
-    logits = pipeline(tokens)
+    logits = trace.construct("forward", lambda: pipeline(tokens))
     mx.eval(reference_logits, logits)
-    sequence.extend((["receive"] if rank == 0 else ["send"]) + ["all_gather"])
-    result = _base_result(rank, sequence + ["result"])
+    trace.eval_complete("forward", "logits")
+    result = _base_result(case, group, pipeline, trace)
     result.update(
         {
+            "input_shape": list(tokens.shape),
+            "logits_shape": list(logits.shape),
+            "reference_logits_shape": list(reference_logits.shape),
             "logits": logits.tolist(),
             "reference_logits": reference_logits.tolist(),
             "checksum": float(mx.sum(logits.astype(mx.float32)).item()),
@@ -119,40 +181,59 @@ def _forward_case(
 
 
 def _cache_dependency_case(
-    rank: int,
+    case: str,
+    group,
     reference: UpstreamModel,
     pipeline: PipelineModel,
-    sequence: list[str],
+    trace: DistributedCallTrace,
 ) -> dict[str, Any]:
     reference_caches = [KVCache(), KVCache()]
     pipeline_caches = pipeline.make_cache()
     tokens = mx.array([[1, 7, 3, 9], [2, 6, 4, 8]])
+    prefill_input_shapes = []
 
-    for start in (0, 2):
-        reference(tokens[:, start : start + 2], cache=reference_caches)
-        pipeline(tokens[:, start : start + 2], cache=pipeline_caches)
+    for chunk_index, start in enumerate((0, 2)):
+        chunk = tokens[:, start : start + 2]
+        prefill_input_shapes.append(list(chunk.shape))
+        reference(chunk, cache=reference_caches)
+        call = f"prefill_{chunk_index}"
+        trace.construct(call, lambda chunk=chunk: pipeline(chunk, cache=pipeline_caches))
         mx.eval(*_cache_tensors(reference_caches))
         mx.eval(*_cache_tensors(pipeline_caches))
+        trace.eval_complete(call, "cache_state")
 
-    layer = 1 if rank == 0 else 0
+    local_layers = [
+        index
+        for index, layer in enumerate(pipeline.model.layers)
+        if layer is not None
+    ]
+    if len(local_layers) != 1:
+        raise AssertionError(f"expected one local layer, got {local_layers}")
+    layer = local_layers[0]
     local_cache = pipeline_caches[0]
     reference_cache = reference_caches[layer]
     prefill_cache = _cache_record(layer, local_cache, reference_cache)
 
     decode_tokens = mx.array([[10], [11]])
     reference_decode_logits = reference(decode_tokens, cache=reference_caches)
-    decode_logits = pipeline(decode_tokens, cache=pipeline_caches)
+    decode_logits = trace.construct(
+        "decode", lambda: pipeline(decode_tokens, cache=pipeline_caches)
+    )
     mx.eval(
         reference_decode_logits,
         decode_logits,
         *_cache_tensors(reference_caches),
         *_cache_tensors(pipeline_caches),
     )
-    sequence.extend((["receive"] if rank == 0 else ["send"]) + ["all_gather"])
+    trace.eval_complete("decode", "logits_and_cache_state")
 
-    result = _base_result(rank, sequence + ["result"])
+    result = _base_result(case, group, pipeline, trace)
     result.update(
         {
+            "prefill_input_shapes": prefill_input_shapes,
+            "decode_input_shape": list(decode_tokens.shape),
+            "decode_logits_shape": list(decode_logits.shape),
+            "reference_decode_logits_shape": list(reference_decode_logits.shape),
             "decode_logits": decode_logits.tolist(),
             "reference_decode_logits": reference_decode_logits.tolist(),
             "checksum": float(mx.sum(decode_logits.astype(mx.float32)).item()),
@@ -166,15 +247,19 @@ def _cache_dependency_case(
 def _negative_cache_dependency_case(
     rank: int,
     pipeline: PipelineModel,
+    trace: DistributedCallTrace,
     output_dir: Path,
 ) -> None:
     pipeline_caches = pipeline.make_cache()
     tokens = mx.array([[1, 7], [2, 6]])
-    pipeline(tokens, cache=pipeline_caches)
+    trace.construct(
+        "negative_prefill", lambda: pipeline(tokens, cache=pipeline_caches)
+    )
     marker = output_dir / "rank-1-cache-evaluated-without-send.marker"
 
     if rank == 1:
         mx.eval(*_cache_tensors(pipeline_caches))
+        trace.eval_complete("negative_prefill", "cache_state")
         output_dir.mkdir(parents=True, exist_ok=True)
         marker.write_text("cache-only evaluation completed", encoding="utf-8")
         raise RuntimeError(
@@ -199,26 +284,27 @@ def _write_result(output_dir: Path, rank: int, result: dict[str, Any]) -> None:
     os.replace(temporary, destination)
 
 
-def _run(case: str, output_dir: Path) -> None:
+def _run(case: str, output_dir: Path, observation: dict[str, Any]) -> None:
     group = mx.distributed.init(strict=True, backend="ring")
     if group.size() != 2:
         raise AssertionError(f"expected exactly two local Ring ranks, got {group.size()}")
     rank = group.rank()
-    sequence = ["group_ready"]
+    observation.update({"rank": rank, "world_size": group.size()})
 
     reference, pipeline = _build_models(group)
-    sequence.append("model_partitioned")
+    trace = DistributedCallTrace()
+    observation["events"] = trace.events
 
     if case == "cache_dependency_bypassed":
         mx.depends = lambda value, *dependencies: value
-        _negative_cache_dependency_case(rank, pipeline, output_dir)
+        _negative_cache_dependency_case(rank, pipeline, trace, output_dir)
 
     if case in ("forward", "sequence_corruption"):
-        result = _forward_case(rank, reference, pipeline, sequence)
+        result = _forward_case(case, group, reference, pipeline, trace)
         if case == "sequence_corruption" and rank == 1:
-            result["sequence"][2:4] = reversed(result["sequence"][2:4])
+            result["events"][0:2] = reversed(result["events"][0:2])
     else:
-        result = _cache_dependency_case(rank, reference, pipeline, sequence)
+        result = _cache_dependency_case(case, group, reference, pipeline, trace)
 
     _write_result(output_dir, rank, result)
 
@@ -228,21 +314,22 @@ def main() -> int:
     parser.add_argument("--case", choices=CASES, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    observation: dict[str, Any] = {"events": []}
     try:
-        _run(args.case, args.output_dir)
+        _run(args.case, args.output_dir, observation)
     except BaseException as exc:
-        rank = int(os.environ.get("MLX_RANK", "-1"))
+        file_rank = observation.get("rank", int(os.environ.get("MLX_RANK", "-1")))
         error_result = {
-            "rank": rank,
-            "world_size": None,
+            "case": args.case,
+            "rank": observation.get("rank"),
+            "world_size": observation.get("world_size"),
             "status": "error",
             "exit_code": 1,
             "error": f"{type(exc).__name__}: {exc}",
-            "traceback": traceback.format_exc(),
-            "sequence": [],
+            "events": observation["events"],
         }
         try:
-            _write_result(args.output_dir, rank, error_result)
+            _write_result(args.output_dir, file_rank, error_result)
         finally:
             return 1
     return 0
