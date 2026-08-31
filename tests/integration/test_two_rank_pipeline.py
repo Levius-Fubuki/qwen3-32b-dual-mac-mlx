@@ -26,6 +26,7 @@ LAUNCH_TIMEOUT_SECONDS = 90
 TERM_GRACE_SECONDS = 2
 PROCESS_CLEANUP_RESERVE_SECONDS = 4
 LOCK_POLL_SECONDS = 0.01
+MAX_DIAGNOSTIC_CHARS = 4_000
 RING_LOCK_PATH = Path("/tmp/qwen3-two-rank-ring-33323.lock")
 _ACTIVE_DEADLINE: _Deadline | None = None
 
@@ -74,8 +75,8 @@ def _module_deadline() -> _Deadline:
 
 
 @contextmanager
-def _ring_launch_lock(deadline: _Deadline) -> Iterator[None]:
-    lock_file = RING_LOCK_PATH.open("a+", encoding="utf-8")
+def _ring_launch_lock(deadline: _Deadline, lock_path: Path) -> Iterator[None]:
+    lock_file = lock_path.open("a+", encoding="utf-8")
     acquired = False
     try:
         while True:
@@ -169,6 +170,21 @@ def _launcher_command(case: str, output_dir: Path) -> list[str]:
         "--output-dir",
         str(output_dir),
     ]
+
+
+def _attach_timeout_output(
+    error: BaseException,
+    stdout: str | bytes | None,
+    stderr: str | bytes | None,
+) -> None:
+    for label, output in (("stdout", stdout), ("stderr", stderr)):
+        if isinstance(output, bytes):
+            text = output.decode(errors="replace")
+        else:
+            text = "" if output is None else str(output)
+        if len(text) > MAX_DIAGNOSTIC_CHARS:
+            text = text[:MAX_DIAGNOSTIC_CHARS] + "\n...[truncated]"
+        error.add_note(f"launcher {label} captured during timeout cleanup:\n{text}")
 
 
 ERROR_KEYS = {
@@ -479,11 +495,16 @@ def _load_rank_results(
     return results
 
 
-def _launch_case(case: str, output_dir: Path) -> list[dict[str, Any]]:
+def _launch_case(
+    case: str,
+    output_dir: Path,
+    *,
+    lock_path: Path = RING_LOCK_PATH,
+) -> list[dict[str, Any]]:
     if not WORKER.is_file():
         raise RingLaunchError(f"two-rank worker is missing: {WORKER}")
     deadline = _module_deadline()
-    with _ring_launch_lock(deadline):
+    with _ring_launch_lock(deadline, lock_path):
         deadline.require(
             "launcher start", reserve=PROCESS_CLEANUP_RESERVE_SECONDS
         )
@@ -502,6 +523,7 @@ def _launch_case(case: str, output_dir: Path) -> list[dict[str, Any]]:
         primary_error: BaseException | None = None
         cleanup_errors: list[BaseException] = []
         results: list[dict[str, Any]] | None = None
+        process_cleanup_attempted = False
         try:
             process = subprocess.Popen(
                 command,
@@ -520,11 +542,24 @@ def _launch_case(case: str, output_dir: Path) -> list[dict[str, Any]]:
                     )
                 )
             except subprocess.TimeoutExpired as exc:
-                raise RingLaunchError(
+                timeout_error = RingLaunchError(
                     f"two-rank case {case!r} exceeded the single overall "
                     f"{LAUNCH_TIMEOUT_SECONDS}s budget; exact launcher process group "
                     f"{process.pid} will be stopped"
-                ) from exc
+                )
+                process_cleanup_attempted = True
+                try:
+                    captured_stdout, captured_stderr = _stop_process_group(
+                        process, deadline
+                    )
+                    _attach_timeout_output(
+                        timeout_error, captured_stdout, captured_stderr
+                    )
+                except BaseException as cleanup_error:
+                    timeout_error.add_note(
+                        f"secondary cleanup failure: {cleanup_error}"
+                    )
+                raise timeout_error from exc
             if process.returncode != 0:
                 raise RingLaunchError(
                     f"launcher exited nonzero ({process.returncode}) for case {case!r}\n"
@@ -539,7 +574,11 @@ def _launch_case(case: str, output_dir: Path) -> list[dict[str, Any]]:
         except BaseException as exc:
             primary_error = exc
 
-        if process is not None and process.poll() is None:
+        if (
+            process is not None
+            and not process_cleanup_attempted
+            and process.poll() is None
+        ):
             try:
                 _stop_process_group(process, deadline)
             except BaseException as exc:
@@ -579,15 +618,16 @@ def _assert_close(actual: Any, expected: Any) -> None:
 
 @pytest.mark.local_integration
 def test_occupied_configured_ring_port_is_rejected_without_fallback() -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", RING_PORTS[0]))
-        listener.listen()
-        with pytest.raises(
-            RingLaunchError,
-            match="33323.*refusing to launch.*never falling back to 32323-32324",
-        ):
-            _assert_ring_ports_free()
+    with _ring_launch_lock(_module_deadline(), RING_LOCK_PATH):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", RING_PORTS[0]))
+            listener.listen()
+            with pytest.raises(
+                RingLaunchError,
+                match="33323.*refusing to launch.*never falling back to 32323-32324",
+            ):
+                _assert_ring_ports_free()
 
 
 @pytest.mark.local_integration
@@ -767,13 +807,63 @@ def test_primary_result_error_survives_secondary_cleanup_failure(
     )
 
     with pytest.raises(RingResultError, match="primary result") as caught:
-        _launch_case("forward", tmp_path / "supervisor")
+        _launch_case(
+            "forward",
+            tmp_path / "supervisor",
+            lock_path=tmp_path / "supervisor.lock",
+        )
 
     assert any("cleanup failed" in note for note in caught.value.__notes__)
 
 
-def test_ring_launch_lock_has_a_bounded_contention_failure() -> None:
-    with _ring_launch_lock(_Deadline(1.0)):
+def test_ring_launch_lock_has_a_bounded_contention_failure(tmp_path: Path) -> None:
+    lock_path = tmp_path / "contention.lock"
+    with _ring_launch_lock(_Deadline(1.0), lock_path):
         with pytest.raises(RingLaunchError, match="lock.*budget"):
-            with _ring_launch_lock(_Deadline(0.05)):
+            with _ring_launch_lock(_Deadline(0.05), lock_path):
                 pytest.fail("contended lock unexpectedly acquired")
+
+
+def test_pure_lock_is_isolated_while_global_ring_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    with _ring_launch_lock(_Deadline(1.0), RING_LOCK_PATH):
+        with _ring_launch_lock(_Deadline(1.0), tmp_path / "isolated.lock"):
+            assert True
+
+
+def test_timeout_error_retains_cleanup_stdout_and_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimedOutProcess:
+        pid = 999_998
+        returncode = None
+
+        def communicate(self, timeout: float):
+            raise subprocess.TimeoutExpired(["mlx.launch"], timeout)
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: TimedOutProcess())
+    monkeypatch.setattr("test_two_rank_pipeline._assert_ring_ports_free", lambda: None)
+    monkeypatch.setattr(
+        "test_two_rank_pipeline._stop_process_group",
+        lambda *args, **kwargs: ("captured stdout", "captured stderr"),
+    )
+    monkeypatch.setattr(
+        "test_two_rank_pipeline._wait_for_ring_ports_to_clear",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RingLaunchError, match="single overall") as caught:
+        _launch_case(
+            "forward",
+            tmp_path / "timeout",
+            lock_path=tmp_path / "timeout.lock",
+        )
+
+    rendered = "\n".join([str(caught.value), *caught.value.__notes__])
+    assert "captured stdout" in rendered
+    assert "captured stderr" in rendered
