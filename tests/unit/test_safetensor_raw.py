@@ -344,6 +344,38 @@ def test_tensor_size_calculation_rejects_u64_overflow(tmp_path: Path) -> None:
         module.read_header(path)
 
 
+@pytest.mark.parametrize("shape", [[0, 2**64], [2**64, 0]])
+def test_reader_rejects_dimension_above_u64_even_next_to_zero(
+    tmp_path: Path, shape: list[int]
+) -> None:
+    module = safetensor_raw()
+    path = _canonical_json_file(
+        tmp_path / "oversized-dimension.safetensors",
+        {"x": {"dtype": "U8", "shape": shape, "data_offsets": [0, 0]}},
+    )
+
+    with pytest.raises(ValueError, match="dimension|overflow"):
+        module.read_header(path)
+    with pytest.raises(safetensors.SafetensorError):
+        safetensors.deserialize(path.read_bytes())
+
+
+@pytest.mark.parametrize("shape", [(0, 2**64), (2**64, 0)])
+def test_writer_rejects_dimension_above_u64_before_output_creation(
+    tmp_path: Path, shape: tuple[int, ...]
+) -> None:
+    module = safetensor_raw()
+    source = tmp_path / "empty-source.bin"
+    source.write_bytes(b"")
+    record = module.TensorRecord("x", "U8", shape, source, 0, 0, 0)
+    output = tmp_path / "oversized-dimension.tmp"
+
+    with pytest.raises(ValueError, match="dimension|overflow"):
+        module.write_shard((record,), output)
+
+    assert not output.exists()
+
+
 @pytest.mark.parametrize(
     ("header", "payload", "message"),
     [
@@ -461,6 +493,71 @@ def test_read_header_accepts_canonical_json_tensor_names(
     shard = module.read_header(path)
     assert shard.tensors[0].name == name
     assert safetensors.deserialize(path.read_bytes())[0][0] == name
+
+
+@pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"], ids=["high", "low"])
+@pytest.mark.parametrize("location", ["tensor-name", "metadata-key", "metadata-value"])
+def test_reader_and_canonical_parser_reject_lone_utf16_surrogates(
+    tmp_path: Path, surrogate: str, location: str
+) -> None:
+    module = safetensor_raw()
+    if location == "tensor-name":
+        header = {
+            surrogate: {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]}
+        }
+    elif location == "metadata-key":
+        header = {"__metadata__": {surrogate: "value"}}
+    else:
+        header = {"__metadata__": {"key": surrogate}}
+    path = _canonical_json_file(
+        tmp_path / f"surrogate-{location}.safetensors", header
+    )
+
+    with pytest.raises(ValueError, match="lone UTF-16 surrogate"):
+        module.read_header(path)
+    with pytest.raises(safetensors.SafetensorError):
+        safetensors.deserialize(path.read_bytes())
+
+
+@pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"], ids=["high", "low"])
+def test_writer_rejects_manual_surrogate_name_before_output_creation(
+    tmp_path: Path, surrogate: str
+) -> None:
+    module = safetensor_raw()
+    source = tmp_path / "empty-source.bin"
+    source.write_bytes(b"")
+    record = module.TensorRecord(surrogate, "U8", (0,), source, 0, 0, 0)
+    output = tmp_path / "surrogate-name.tmp"
+
+    with pytest.raises(ValueError, match="lone UTF-16 surrogate"):
+        module.write_shard((record,), output)
+
+    assert not output.exists()
+
+
+def test_valid_non_bmp_unicode_name_and_metadata_parse_and_name_round_trip(
+    tmp_path: Path,
+) -> None:
+    module = safetensor_raw()
+    name = "😀.weight"
+    path = _canonical_json_file(
+        tmp_path / "non-bmp.safetensors",
+        {
+            "__metadata__": {"用途😀": "量化🚀"},
+            name: {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+        },
+        b"x",
+    )
+
+    records = module.read_header(path).tensors
+    assert records[0].name == name
+    assert safetensors.deserialize(path.read_bytes())[0][0] == name
+
+    output = tmp_path / "non-bmp.tmp"
+    module.write_shard(records, output)
+    rewritten = module.read_header(output)
+    assert rewritten.tensors[0].name == name
+    assert _payload_sha(rewritten.tensors[0]) == hashlib.sha256(b"x").hexdigest()
 
 
 @pytest.mark.parametrize("chunk_bytes", [0, -1, True, 1.5, 8 * MIB + 1])

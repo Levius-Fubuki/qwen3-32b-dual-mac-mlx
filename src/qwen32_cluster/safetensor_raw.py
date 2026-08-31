@@ -97,16 +97,26 @@ def _require_int(value: Any, label: str, *, minimum: int | None = None) -> int:
     return value
 
 
+def _validate_unicode_scalar(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise ValueError(f"{label} contains a lone UTF-16 surrogate")
+    return value
+
+
 def _validate_name(name: Any) -> str:
-    if not isinstance(name, str) or name == "__metadata__":
+    value = _validate_unicode_scalar(name, "tensor name")
+    if value == "__metadata__":
         raise ValueError("tensor name must be a JSON string other than __metadata__")
-    return name
+    return value
 
 
 def _tensor_nbytes(
     dtype: Any, shape: Any, label: str
 ) -> tuple[str, tuple[int, ...], int]:
-    if not isinstance(dtype, str) or dtype not in _DTYPE_BITS:
+    dtype = _validate_unicode_scalar(dtype, f"{label} dtype")
+    if dtype not in _DTYPE_BITS:
         raise ValueError(f"{label} dtype is not supported")
     if not isinstance(shape, list):
         raise ValueError(f"{label} shape must be a JSON list")
@@ -114,6 +124,10 @@ def _tensor_nbytes(
     elements = 1
     for index, dimension in enumerate(shape):
         value = _require_int(dimension, f"{label} shape[{index}]", minimum=0)
+        if value > _MAX_U64:
+            raise ValueError(
+                f"{label} shape[{index}] dimension exceeds unsigned 64-bit range"
+            )
         dimensions.append(value)
         if value and elements > _MAX_U64 // value:
             raise ValueError(f"{label} shape product overflow")
@@ -244,11 +258,11 @@ def _parse_header(
 
     if "__metadata__" in header:
         metadata = header["__metadata__"]
-        if not isinstance(metadata, Mapping) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in metadata.items()
-        ):
+        if not isinstance(metadata, Mapping):
             raise ValueError("safetensor metadata must map strings to strings")
+        for key, value in metadata.items():
+            _validate_unicode_scalar(key, "metadata key")
+            _validate_unicode_scalar(value, "metadata value")
 
     records: list[TensorRecord] = []
     for raw_name, value in header.items():
