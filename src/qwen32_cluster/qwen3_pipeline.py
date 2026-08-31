@@ -29,11 +29,11 @@ def partition_layers(
     stage_layers: Optional[Sequence[int]] = None,
 ) -> PipelinePartition:
     """Map forward-order stages onto reverse-order distributed ranks."""
-    if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers <= 0:
+    if type(num_layers) is not int or num_layers <= 0:
         raise ValueError("num_layers must be a positive integer")
-    if world_size not in (1, 2):
+    if type(world_size) is not int or world_size not in (1, 2):
         raise ValueError("world_size must be 1 or 2")
-    if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < world_size:
+    if type(rank) is not int or not 0 <= rank < world_size:
         raise ValueError("rank must be in range(world_size)")
 
     if stage_layers is None:
@@ -43,12 +43,14 @@ def partition_layers(
             for stage_index in range(world_size)
         )
     else:
+        if not isinstance(stage_layers, Sequence):
+            raise ValueError("stage_layers must be a sequence")
         sizes = tuple(stage_layers)
         if len(sizes) != world_size:
             raise ValueError("stage_layers must contain one entry per rank")
 
     if any(
-        not isinstance(size, int) or isinstance(size, bool) or size <= 0
+        type(size) is not int or size <= 0
         for size in sizes
     ):
         raise ValueError("stage layer counts must be positive integers")
@@ -83,7 +85,7 @@ class Qwen3PipelineModel(UpstreamQwen3Model):
     def pipeline(self, group) -> None:
         rank = group.rank()
         world_size = group.size()
-        if world_size != 2:
+        if type(world_size) is not int or world_size != 2:
             raise ValueError("Qwen3 pipeline execution requires exactly two ranks")
 
         stage_layers = self.args.pipeline_stage_layers
@@ -127,8 +129,15 @@ class Qwen3PipelineModel(UpstreamQwen3Model):
 
         h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
         cache = [None] * len(self.pipeline_layers) if cache is None else cache
-        if len(cache) != len(self.pipeline_layers):
+        try:
+            cache_length = len(cache)
+        except TypeError as exc:
+            raise ValueError("cache must be a sequence") from exc
+        if cache_length != len(self.pipeline_layers):
             raise ValueError("cache must contain one entry per local pipeline layer")
+        populated = [layer_cache is not None for layer_cache in cache]
+        if any(populated) and not all(populated):
+            raise ValueError("cache entries must be all None or all populated")
         mask = create_attention_mask(h, cache[0])
         if self.pipeline_rank < self.pipeline_size - 1:
             h = mx.distributed.recv_like(h, self.pipeline_rank + 1)

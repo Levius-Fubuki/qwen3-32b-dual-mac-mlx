@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 from importlib import import_module
 from pathlib import Path
 
@@ -64,6 +65,17 @@ def layer_numbers(model) -> set[int]:
     }
 
 
+def is_portable_adapter_import(module_name: str) -> bool:
+    root = module_name.split(".", 1)[0]
+    return (
+        root in sys.stdlib_module_names
+        or module_name == "mlx"
+        or module_name in {"mlx.core", "mlx.nn"}
+        or module_name == "mlx_lm"
+        or module_name.startswith("mlx_lm.")
+    )
+
+
 def test_weighted_partition_maps_forward_stages_to_reverse_ranks() -> None:
     module = qwen3_pipeline()
     first = module.partition_layers(64, rank=1, world_size=2, stage_layers=[40, 24])
@@ -98,21 +110,30 @@ def test_single_rank_partition_preserves_the_whole_model() -> None:
 @pytest.mark.parametrize(
     ("num_layers", "rank", "world_size", "stage_layers"),
     [
+        (True, 0, 1, None),
+        (4.0, 0, 1, None),
         (4, -1, 2, None),
         (4, 2, 2, None),
+        (4, True, 2, None),
+        (4, 0.0, 2, None),
+        (4, 0, True, None),
+        (4, 0, 2.0, None),
         (4, 0, 0, None),
         (4, 0, 3, None),
+        (4, 0, 2, 2),
         (4, 0, 2, [4]),
+        (4, 0, 2, [True, 3]),
+        (4, 0, 2, [2.0, 2]),
         (4, 0, 2, [2, 0]),
         (4, 0, 2, [2, -1]),
         (4, 0, 2, [3, 2]),
     ],
 )
 def test_partition_rejects_invalid_topologies(
-    num_layers: int,
-    rank: int,
-    world_size: int,
-    stage_layers: list[int] | None,
+    num_layers: object,
+    rank: object,
+    world_size: object,
+    stage_layers: object,
 ) -> None:
     module = qwen3_pipeline()
     with pytest.raises(ValueError):
@@ -161,6 +182,80 @@ def test_make_cache_returns_exactly_one_kv_cache_per_local_layer() -> None:
 
     assert len(cache) == 5
     assert all(isinstance(item, KVCache) for item in cache)
+
+
+@pytest.mark.parametrize(
+    "cache",
+    [
+        pytest.param([KVCache(), None], id="live-then-none"),
+        pytest.param([None, KVCache()], id="none-then-live"),
+    ],
+)
+def test_mixed_cache_is_rejected_before_layer_or_collective_work(
+    cache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = qwen3_pipeline()
+    model = module.Model(model_args(num_layers=4, stage_layers=[2, 2]))
+    model.model.pipeline(FakeGroup(1, 2))
+    collective_calls = []
+
+    def record_collective(h, *args):
+        collective_calls.append(args)
+        return h
+
+    monkeypatch.setattr(mx.distributed, "recv_like", record_collective)
+    monkeypatch.setattr(mx.distributed, "send", record_collective)
+    monkeypatch.setattr(mx.distributed, "all_gather", record_collective)
+
+    with pytest.raises(ValueError, match="all None or all populated"):
+        model.model(mx.array([[1, 2]]), cache=cache)
+
+    assert collective_calls == []
+    assert all(item is None or item.empty() for item in cache)
+
+
+@pytest.mark.parametrize(
+    "cache",
+    [
+        pytest.param([], id="empty"),
+        pytest.param([KVCache()], id="too-short"),
+        pytest.param([KVCache(), KVCache(), KVCache()], id="too-long"),
+    ],
+)
+def test_wrong_length_cache_is_rejected_before_collectives(
+    cache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = qwen3_pipeline()
+    model = module.Model(model_args(num_layers=4, stage_layers=[2, 2]))
+    model.model.pipeline(FakeGroup(1, 2))
+    collective_calls = []
+
+    def record_collective(h, *args):
+        collective_calls.append(args)
+        return h
+
+    monkeypatch.setattr(mx.distributed, "recv_like", record_collective)
+    monkeypatch.setattr(mx.distributed, "send", record_collective)
+    monkeypatch.setattr(mx.distributed, "all_gather", record_collective)
+
+    with pytest.raises(ValueError, match="one entry per local pipeline layer"):
+        model.model(mx.array([[1, 2]]), cache=cache)
+
+    assert collective_calls == []
+
+
+def test_none_and_fully_populated_cache_forms_remain_usable() -> None:
+    module = qwen3_pipeline()
+    model = module.Model(model_args(num_layers=2))
+    tokens = mx.array([[1, 2]])
+
+    uncached = model(tokens, cache=None)
+    populated_cache = model.make_cache()
+    cached = model(tokens, cache=populated_cache)
+    mx.eval(uncached, cached)
+
+    assert uncached.shape == cached.shape == (1, 2, 32)
+    assert [item.offset for item in populated_cache] == [2, 2]
 
 
 def test_pipeline_rejects_non_two_rank_group_before_pruning() -> None:
@@ -260,6 +355,15 @@ def test_adapter_source_is_standalone_and_constructs_one_qwen3_body() -> None:
         isinstance(node, ast.ImportFrom) and node.level
         for node in ast.walk(tree)
     ), "custom model_file cannot use relative imports"
+    imported_modules = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.module is not None
+            imported_modules.append(node.module)
+    assert imported_modules
+    assert all(is_portable_adapter_import(name) for name in imported_modules)
     assert "from mlx_lm.models.base import create_attention_mask" in source
     assert "from mlx_lm.models.cache import KVCache" in source
     assert "from mlx_lm.models.qwen3 import (" in source
@@ -286,3 +390,19 @@ def test_adapter_source_is_standalone_and_constructs_one_qwen3_body() -> None:
         and node.func.id == "UpstreamModel"
         for node in ast.walk(tree)
     )
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "qwen32_cluster.helpers",
+        "mlx.utils",
+        "numpy",
+        "requests",
+        "local_adapter_helpers",
+    ],
+)
+def test_portable_adapter_import_policy_rejects_project_and_third_party_modules(
+    module_name: str,
+) -> None:
+    assert not is_portable_adapter_import(module_name)
