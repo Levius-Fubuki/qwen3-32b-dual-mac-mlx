@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 
-_DEFAULT_CHUNK_BYTES = 8 << 20
+MAX_COPY_CHUNK_BYTES = 8 << 20
 _MAX_HEADER_BYTES = 100_000_000
 _TENSOR_FIELDS = frozenset({"dtype", "shape", "data_offsets"})
 _DTYPE_BYTES = {
@@ -171,8 +171,8 @@ def read_header(path: Path) -> SourceShard:
     if not isinstance(header, Mapping):
         raise ValueError("safetensor header root must be a JSON object")
 
-    metadata = header.get("__metadata__")
-    if metadata is not None:
+    if "__metadata__" in header:
+        metadata = header["__metadata__"]
         if not isinstance(metadata, Mapping) or any(
             not isinstance(key, str) or not isinstance(value, str)
             for key, value in metadata.items()
@@ -322,10 +322,16 @@ def _copy_payload_validated(
 def copy_payload(
     record: TensorRecord,
     dst_fd: int,
-    chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
+    chunk_bytes: int = MAX_COPY_CHUNK_BYTES,
 ) -> str:
-    if type(chunk_bytes) is not int or chunk_bytes <= 0:
-        raise ValueError("chunk_bytes must be a positive integer")
+    if (
+        type(chunk_bytes) is not int
+        or chunk_bytes <= 0
+        or chunk_bytes > MAX_COPY_CHUNK_BYTES
+    ):
+        raise ValueError(
+            f"chunk_bytes must be an integer from 1 through {MAX_COPY_CHUNK_BYTES}"
+        )
     if type(dst_fd) is not int or dst_fd < 0:
         raise ValueError("dst_fd must be a non-negative integer file descriptor")
     _validate_record(record)
@@ -402,7 +408,7 @@ def write_shard(records: Sequence[TensorRecord], output_tmp: Path) -> ShardResul
             digest = _copy_payload_validated(
                 record,
                 output_fd,
-                _DEFAULT_CHUNK_BYTES,
+                MAX_COPY_CHUNK_BYTES,
                 file_hasher,
             )
             payload_hashes.append((record.name, digest))

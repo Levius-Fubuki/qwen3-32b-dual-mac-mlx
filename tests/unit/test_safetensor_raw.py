@@ -181,9 +181,17 @@ def test_copy_payload_materialization_stays_bounded_as_payload_grows(
         (b"[]", b"", "root"),
         (b'{"x":{"dtype":"U8","dtype":"U8","shape":[1],"data_offsets":[0,1]}}', b"x", "duplicate"),
         (b'{"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}', b"x", "duplicate"),
+        (b'{"__metadata__":null}', b"", "metadata"),
         (b'{"__metadata__":{"key":1}}', b"", "metadata"),
     ],
-    ids=["invalid-json", "non-object-root", "duplicate-field", "duplicate-name", "invalid-metadata"],
+    ids=[
+        "invalid-json",
+        "non-object-root",
+        "duplicate-field",
+        "duplicate-name",
+        "null-metadata",
+        "invalid-metadata",
+    ],
 )
 def test_read_header_rejects_invalid_json_and_duplicate_keys(
     tmp_path: Path, header: bytes, payload: bytes, message: str
@@ -275,7 +283,7 @@ def test_read_header_rejects_unsafe_tensor_names(tmp_path: Path) -> None:
         module.read_header(path)
 
 
-@pytest.mark.parametrize("chunk_bytes", [0, -1, True, 1.5])
+@pytest.mark.parametrize("chunk_bytes", [0, -1, True, 1.5, 8 * MIB + 1])
 def test_copy_payload_rejects_invalid_chunk_size(
     tmp_path: Path, chunk_bytes: object
 ) -> None:
@@ -289,6 +297,35 @@ def test_copy_payload_rejects_invalid_chunk_size(
             module.copy_payload(record, destination, chunk_bytes=chunk_bytes)
     finally:
         os.close(destination)
+
+
+def test_copy_payload_never_requests_more_than_eight_mib_for_large_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = safetensor_raw()
+    payload_size = 8 * MIB + 4096
+    source = tmp_path / "large-payload.bin"
+    with source.open("wb") as source_file:
+        source_file.truncate(payload_size)
+    record = module.TensorRecord(
+        "large", "U8", (payload_size,), source, 0, payload_size, payload_size
+    )
+    original_pread = os.pread
+    requested_sizes: list[int] = []
+
+    def tracking_pread(fd: int, count: int, offset: int) -> bytes:
+        requested_sizes.append(count)
+        return original_pread(fd, count, offset)
+
+    monkeypatch.setattr(os, "pread", tracking_pread)
+    destination = os.open(os.devnull, os.O_WRONLY)
+    try:
+        module.copy_payload(record, destination)
+    finally:
+        os.close(destination)
+
+    assert requested_sizes == [8 * MIB, 4096]
+    assert max(requested_sizes) <= 8 * MIB
 
 
 def test_copy_payload_rejects_truncated_reads(
