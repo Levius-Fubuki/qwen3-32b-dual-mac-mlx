@@ -1217,6 +1217,61 @@ def _validate_staged_output(plan: RankPackPlan, expected: RankManifest) -> None:
         raise ValueError("complete staging marker differs from plan")
 
 
+def _path_identifies_snapshot(path: Path, snapshot: FileSnapshot) -> bool:
+    try:
+        value = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(value.st_mode) and (
+        value.st_dev,
+        value.st_ino,
+    ) == (
+        snapshot.device,
+        snapshot.inode,
+    )
+
+
+def _unlink_snapshot_path(path: Path, snapshot: FileSnapshot, error: BaseException) -> None:
+    if not _path_identifies_snapshot(path, snapshot):
+        return
+    try:
+        os.unlink(path)
+    except BaseException as cleanup_error:
+        error.add_note(f"failed to remove the tool-owned final manifest: {cleanup_error}")
+
+
+def _rollback_final_manifest(
+    staging: Path,
+    final: Path,
+    staging_snapshot: FileSnapshot,
+    error: BaseException,
+) -> None:
+    try:
+        final_is_owned = _path_identifies_snapshot(final, staging_snapshot)
+        staging_exists = staging.exists() or staging.is_symlink()
+        if final_is_owned and not staging_exists:
+            try:
+                os.replace(final, staging)
+            except BaseException as rollback_error:
+                error.add_note(
+                    f"failed to restore the complete staging manifest: {rollback_error}"
+                )
+
+        if _path_identifies_snapshot(final, staging_snapshot):
+            _unlink_snapshot_path(final, staging_snapshot, error)
+        if not _path_identifies_snapshot(staging, staging_snapshot):
+            error.add_note(
+                "the complete staging manifest could not be restored; no tool-owned "
+                "valid final manifest was retained"
+            )
+    except BaseException as rollback_error:
+        error.add_note(f"failed while inspecting final manifest rollback state: {rollback_error}")
+    try:
+        _fsync_directory(final.parent)
+    except BaseException as fsync_error:
+        error.add_note(f"failed to fsync final manifest rollback state: {fsync_error}")
+
+
 def _prepare_output(plan: RankPackPlan, expected: RankManifest, force: bool) -> RankManifest | None:
     output = plan.output_dir
     if output.exists() or output.is_symlink():
@@ -1299,23 +1354,14 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
     final = output / FINAL_MANIFEST_NAME
     if final.exists() or final.is_symlink():
         raise FileExistsError("refusing to overwrite final rank manifest")
-    os.replace(staging, final)
+    _, staging_snapshot = _read_regular(staging, "complete staging rank manifest")
     try:
+        os.replace(staging, final)
+        if not _path_identifies_snapshot(final, staging_snapshot):
+            raise RuntimeError("final manifest identity changed during publication")
         _fsync_directory(output)
     except BaseException as error:
-        try:
-            if final.exists() and not staging.exists():
-                os.replace(final, staging)
-                try:
-                    _fsync_directory(output)
-                except OSError as recovery_error:
-                    error.add_note(
-                        f"failed to fsync the restored staging marker: {recovery_error}"
-                    )
-        except OSError as recovery_error:
-            error.add_note(
-                f"failed to restore the staging marker after final fsync failure: {recovery_error}"
-            )
+        _rollback_final_manifest(staging, final, staging_snapshot, error)
         raise
     return expected
 

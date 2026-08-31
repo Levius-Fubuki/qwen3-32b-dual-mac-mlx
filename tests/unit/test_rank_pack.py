@@ -536,6 +536,105 @@ def test_final_directory_fsync_failure_restores_complete_staging_marker(
     assert marker["state"] == "complete"
 
 
+class _InjectedBaseException(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("boundary", "failure_type"),
+    [
+        ("post-rename", KeyboardInterrupt),
+        ("post-rename", _InjectedBaseException),
+        ("post-rename", OSError),
+        ("replace", OSError),
+        ("fsync", OSError),
+    ],
+)
+def test_final_manifest_publication_rolls_back_only_its_renamed_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    failure_type: type[BaseException],
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
+    failure = failure_type(f"injected {boundary} failure")
+    unknown = output / "unknown-user-file.txt"
+
+    if boundary in {"post-rename", "replace"}:
+        original_replace = os.replace
+
+        def fail_final_replace(source_path, destination_path) -> None:
+            source_value = Path(source_path)
+            destination_value = Path(destination_path)
+            if (
+                source_value.name == module.STAGING_MANIFEST_NAME
+                and destination_value.name == module.FINAL_MANIFEST_NAME
+            ):
+                if boundary == "post-rename":
+                    original_replace(source_path, destination_path)
+                unknown.write_text("preserve me", encoding="utf-8")
+                raise failure
+            original_replace(source_path, destination_path)
+
+        monkeypatch.setattr(os, "replace", fail_final_replace)
+    else:
+        original_fsync = module._fsync_directory
+        injected = False
+
+        def fail_final_fsync(path: Path) -> None:
+            nonlocal injected
+            if not injected and (path / module.FINAL_MANIFEST_NAME).exists():
+                injected = True
+                unknown.write_text("preserve me", encoding="utf-8")
+                raise failure
+            original_fsync(path)
+
+        monkeypatch.setattr(module, "_fsync_directory", fail_final_fsync)
+
+    with pytest.raises(
+        failure_type, match=f"injected {boundary} failure"
+    ) as caught:
+        module.pack_rank(plan)
+
+    assert caught.value is failure
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+    marker = json.loads((output / module.STAGING_MANIFEST_NAME).read_text())
+    assert marker["plan_id"] == plan.plan_id
+    assert marker["state"] == "complete"
+    assert unknown.read_text() == "preserve me"
+
+
+def test_final_publication_detects_and_preserves_an_unrelated_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
+    original_replace = os.replace
+    displaced = output / "displaced-tool-manifest"
+    unrelated = b"unrelated replacement\n"
+
+    def replace_then_substitute(source_path, destination_path) -> None:
+        original_replace(source_path, destination_path)
+        if (
+            Path(source_path).name == module.STAGING_MANIFEST_NAME
+            and Path(destination_path).name == module.FINAL_MANIFEST_NAME
+        ):
+            original_replace(destination_path, displaced)
+            Path(destination_path).write_bytes(unrelated)
+
+    monkeypatch.setattr(os, "replace", replace_then_substitute)
+    with pytest.raises(RuntimeError, match="identity"):
+        module.pack_rank(plan)
+
+    assert (output / module.FINAL_MANIFEST_NAME).read_bytes() == unrelated
+    assert displaced.is_file()
+
+
 def test_unknown_file_race_prevents_final_manifest_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
