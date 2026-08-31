@@ -71,6 +71,13 @@ def test_profile_rejects_invalid_values(bits, layers, context, prefill) -> None:
         module.Profile("invalid", bits, layers, prefill, context)
 
 
+@pytest.mark.parametrize("context", [8192.0, True, "8192"])
+def test_profile_rejects_non_integer_context_limit(context) -> None:
+    module = profiles()
+    with pytest.raises(ValueError, match="context_limit must be an integer"):
+        module.Profile("invalid-context", 4, (32, 32), 256, context)
+
+
 def test_profile_strict_parser_rejects_unknown_fields() -> None:
     module = profiles()
     with pytest.raises(ValueError, match="unexpected"):

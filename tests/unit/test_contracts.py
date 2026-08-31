@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import json
 from importlib import import_module
 from pathlib import Path
@@ -75,6 +76,21 @@ def test_cluster_host_is_frozen_and_serializes_deterministically() -> None:
         '{"mlx_peak_guardrail_bytes":12133282611,"name":"M4","rank":1,'
         '"ssh":"kelly@169.254.82.82","thunderbolt_ip":"169.254.82.82"}\n'
     )
+
+
+def test_cluster_host_rejects_integer_form_thunderbolt_ip() -> None:
+    module = contracts()
+    numeric_ip = int(ipaddress.IPv4Address("169.254.217.74"))
+    with pytest.raises(ValueError, match="thunderbolt_ip must be a non-empty string"):
+        module.ClusterHost(0, "M3", "127.0.0.1", numeric_ip, 10844792422)
+
+
+def test_cluster_host_parser_rejects_integer_form_thunderbolt_ip() -> None:
+    module = contracts()
+    payload = valid_cluster_payload()["hosts"][0]
+    payload["thunderbolt_ip"] = int(ipaddress.IPv4Address("169.254.217.74"))
+    with pytest.raises(ValueError, match="thunderbolt_ip must be a non-empty string"):
+        module.ClusterHost.from_dict(payload)
 
 
 def test_cluster_config_round_trips_canonical_json(tmp_path: Path) -> None:

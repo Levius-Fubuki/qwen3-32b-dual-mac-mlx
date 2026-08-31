@@ -36,6 +36,7 @@ class Profile:
         _require_int(self.prefill_step_size, "prefill_step_size")
         if self.prefill_step_size not in VALID_PREFILL_STEP_SIZES:
             raise ValueError(f"prefill_step_size must be one of {sorted(VALID_PREFILL_STEP_SIZES)}")
+        _require_int(self.context_limit, "context_limit")
         if self.context_limit != CANONICAL_CONTEXT_LIMIT:
             raise ValueError(f"context_limit must be {CANONICAL_CONTEXT_LIMIT}")
 

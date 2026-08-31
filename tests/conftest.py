@@ -6,12 +6,14 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from qwen32_cluster.contracts import _load_json
+from qwen32_cluster.profiles import Profile, ProfilesConfig
+
 
 EXPECTED_RING_HOSTS = [
     {"ssh": "127.0.0.1", "ips": ["169.254.217.74"]},
     {"ssh": "kelly@169.254.82.82", "ips": ["169.254.82.82"]},
 ]
-CANONICAL_PROFILE_FILE = (Path(__file__).parents[1] / "config" / "profiles.json").resolve()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -35,9 +37,14 @@ def _canonical_profile_file(raw_path: str | None) -> bool:
     if not raw_path:
         return False
     try:
-        return Path(raw_path).resolve(strict=True) == CANONICAL_PROFILE_FILE
-    except OSError:
+        payload = _load_json(raw_path)
+        if set(payload) == {"profiles", "server"}:
+            ProfilesConfig.from_dict(payload)
+        else:
+            Profile.from_dict(payload)
+    except (OSError, TypeError, ValueError):
         return False
+    return True
 
 
 def _loopback_base_url(raw_url: str | None) -> bool:
@@ -66,13 +73,17 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     base_url_ok = _loopback_base_url(config.getoption("--base-url"))
 
     skip_cluster = pytest.mark.skip(reason="requires explicit validated --hostfile")
-    skip_metadata = pytest.mark.skip(reason="requires canonical explicit --profile-file")
+    skip_profile = pytest.mark.skip(reason="requires explicit validated --profile-file")
     skip_live = pytest.mark.skip(reason="requires explicit http://127.0.0.1:<port> --base-url")
 
     for item in items:
-        if item.get_closest_marker("cluster") and not hostfile_ok:
+        cluster_marker = item.get_closest_marker("cluster")
+        if cluster_marker and not hostfile_ok:
             item.add_marker(skip_cluster)
-        if item.get_closest_marker("model_metadata") and not profile_ok:
-            item.add_marker(skip_metadata)
+        requires_profile = bool(item.get_closest_marker("model_metadata")) or bool(
+            cluster_marker and cluster_marker.kwargs.get("requires_profile", False)
+        )
+        if requires_profile and not profile_ok:
+            item.add_marker(skip_profile)
         if item.get_closest_marker("live_api") and not base_url_ok:
             item.add_marker(skip_live)

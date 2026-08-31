@@ -119,6 +119,7 @@ class ClusterHost:
         _require_string(self.name, "name")
         if self.ssh not in ALLOWED_SSH_ENDPOINTS:
             raise ValueError(f"ssh must be one of {sorted(ALLOWED_SSH_ENDPOINTS)}")
+        _require_string(self.thunderbolt_ip, "thunderbolt_ip")
         try:
             address = ipaddress.ip_address(self.thunderbolt_ip)
         except ValueError as exc:
