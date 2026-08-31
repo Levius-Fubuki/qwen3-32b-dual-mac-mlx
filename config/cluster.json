@@ -1,0 +1,37 @@
+{
+  "hosts": [
+    {
+      "rank": 0,
+      "name": "M3",
+      "ssh": "127.0.0.1",
+      "thunderbolt_ip": "169.254.217.74",
+      "mlx_peak_guardrail_bytes": 10844792422
+    },
+    {
+      "rank": 1,
+      "name": "M4",
+      "ssh": "kelly@169.254.82.82",
+      "thunderbolt_ip": "169.254.82.82",
+      "mlx_peak_guardrail_bytes": 12133282611
+    }
+  ],
+  "ring": {
+    "hostfile": "/Users/Shared/mlx-cluster/hosts.json",
+    "starting_port": 33323,
+    "hosts": [
+      {
+        "ssh": "127.0.0.1",
+        "ips": ["169.254.217.74"]
+      },
+      {
+        "ssh": "kelly@169.254.82.82",
+        "ips": ["169.254.82.82"]
+      }
+    ]
+  },
+  "deployment_ports": {
+    "internal": 18081,
+    "canary": 18080,
+    "public": 8080
+  }
+}

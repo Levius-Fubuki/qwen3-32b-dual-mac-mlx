@@ -1,0 +1,45 @@
+{
+  "profiles": [
+    {
+      "name": "balanced-4bit",
+      "quantization_bits": 4,
+      "stage_layers": [32, 32],
+      "prefill_step_size": 256,
+      "context_limit": 8192
+    },
+    {
+      "name": "quality-4bit",
+      "quantization_bits": 4,
+      "stage_layers": [36, 28],
+      "prefill_step_size": 256,
+      "context_limit": 8192
+    },
+    {
+      "name": "performance-3bit",
+      "quantization_bits": 3,
+      "stage_layers": [40, 24],
+      "prefill_step_size": 256,
+      "context_limit": 8192
+    },
+    {
+      "name": "aggressive-3bit",
+      "quantization_bits": 3,
+      "stage_layers": [44, 20],
+      "prefill_step_size": 256,
+      "context_limit": 8192
+    },
+    {
+      "name": "balanced-3bit",
+      "quantization_bits": 3,
+      "stage_layers": [36, 28],
+      "prefill_step_size": 256,
+      "context_limit": 8192
+    }
+  ],
+  "server": {
+    "decode_concurrency": 1,
+    "prompt_concurrency": 1,
+    "prompt_cache_size": 0,
+    "prompt_cache_bytes": 0
+  }
+}
