@@ -6,35 +6,48 @@ import os
 import stat
 import struct
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 
 MAX_COPY_CHUNK_BYTES = 8 << 20
 _MAX_HEADER_BYTES = 100_000_000
+_MAX_U64 = (1 << 64) - 1
 _TENSOR_FIELDS = frozenset({"dtype", "shape", "data_offsets"})
-_DTYPE_BYTES = {
-    "BOOL": 1,
-    "I8": 1,
-    "U8": 1,
-    "F8_E4M3FN": 1,
-    "F8_E4M3FNUZ": 1,
-    "F8_E5M2": 1,
-    "F8_E5M2FNUZ": 1,
-    "I16": 2,
-    "U16": 2,
-    "F16": 2,
-    "BF16": 2,
-    "I32": 4,
-    "U32": 4,
-    "F32": 4,
-    "I64": 8,
-    "U64": 8,
-    "F64": 8,
-    "C64": 8,
-    "C128": 16,
+_DTYPE_BITS = {
+    "F4": 4,
+    "F6_E2M3": 6,
+    "F6_E3M2": 6,
+    "BOOL": 8,
+    "U8": 8,
+    "I8": 8,
+    "F8_E5M2": 8,
+    "F8_E4M3": 8,
+    "F8_E8M0": 8,
+    "F8_E4M3FNUZ": 8,
+    "F8_E5M2FNUZ": 8,
+    "I16": 16,
+    "U16": 16,
+    "F16": 16,
+    "BF16": 16,
+    "I32": 32,
+    "U32": 32,
+    "F32": 32,
+    "C64": 64,
+    "F64": 64,
+    "I64": 64,
+    "U64": 64,
 }
+
+
+@dataclass(frozen=True)
+class _SourceIdentity:
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
 
 
 @dataclass(frozen=True)
@@ -46,6 +59,9 @@ class TensorRecord:
     start: int
     end: int
     nbytes: int
+    _source_identity: _SourceIdentity | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -67,6 +83,12 @@ class ShardResult:
     payload_sha256: tuple[tuple[str, str], ...]
 
 
+@dataclass
+class _SourceHandle:
+    fd: int
+    identity: _SourceIdentity
+
+
 def _require_int(value: Any, label: str, *, minimum: int | None = None) -> int:
     if type(value) is not int:
         raise ValueError(f"{label} must be an integer")
@@ -76,17 +98,15 @@ def _require_int(value: Any, label: str, *, minimum: int | None = None) -> int:
 
 
 def _validate_name(name: Any) -> str:
-    if not isinstance(name, str) or not name or name == "__metadata__":
-        raise ValueError("tensor name must be a non-empty, non-reserved string")
-    if any(ord(character) < 32 or ord(character) == 127 for character in name):
-        raise ValueError(f"tensor name contains an unsafe control character: {name!r}")
+    if not isinstance(name, str) or name == "__metadata__":
+        raise ValueError("tensor name must be a JSON string other than __metadata__")
     return name
 
 
 def _tensor_nbytes(
     dtype: Any, shape: Any, label: str
 ) -> tuple[str, tuple[int, ...], int]:
-    if not isinstance(dtype, str) or dtype not in _DTYPE_BYTES:
+    if not isinstance(dtype, str) or dtype not in _DTYPE_BITS:
         raise ValueError(f"{label} dtype is not supported")
     if not isinstance(shape, list):
         raise ValueError(f"{label} shape must be a JSON list")
@@ -95,8 +115,33 @@ def _tensor_nbytes(
     for index, dimension in enumerate(shape):
         value = _require_int(dimension, f"{label} shape[{index}]", minimum=0)
         dimensions.append(value)
+        if value and elements > _MAX_U64 // value:
+            raise ValueError(f"{label} shape product overflow")
         elements *= value
-    return dtype, tuple(dimensions), elements * _DTYPE_BYTES[dtype]
+    bits = _DTYPE_BITS[dtype]
+    if elements and elements > _MAX_U64 // bits:
+        raise ValueError(f"{label} bit size overflow")
+    total_bits = elements * bits
+    if total_bits % 8:
+        raise ValueError(f"{label} size does not end on a byte boundary")
+    return dtype, tuple(dimensions), total_bits // 8
+
+
+def _identity_from_stat(source_stat: os.stat_result) -> _SourceIdentity:
+    return _SourceIdentity(
+        device=source_stat.st_dev,
+        inode=source_stat.st_ino,
+        size=source_stat.st_size,
+        mtime_ns=source_stat.st_mtime_ns,
+        ctime_ns=source_stat.st_ctime_ns,
+    )
+
+
+def _require_stable_identity(
+    expected: _SourceIdentity, actual_stat: os.stat_result, label: str
+) -> None:
+    if _identity_from_stat(actual_stat) != expected:
+        raise ValueError(f"{label} source identity changed")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -138,17 +183,24 @@ def _validate_offsets(
             raise ValueError(f"tensor {record.name!r} offset order is invalid")
         if record.start < previous_end:
             raise ValueError(f"tensor {record.name!r} payload overlaps another tensor")
-        previous_end = max(previous_end, record.end)
+        if record.start > previous_end:
+            raise ValueError(f"tensor {record.name!r} leaves a hole in the payload")
+        previous_end = record.end
+    if previous_end != file_size:
+        raise ValueError("safetensor payload has unindexed trailing bytes")
 
 
 def read_header(path: Path) -> SourceShard:
     source_path = Path(path)
-    file_size = source_path.stat().st_size
-    if file_size < 8:
-        raise ValueError("safetensor file is too short for its header length")
-
     fd = os.open(source_path, os.O_RDONLY)
     try:
+        initial_stat = os.fstat(fd)
+        if not stat.S_ISREG(initial_stat.st_mode):
+            raise ValueError("safetensor source is not a regular file")
+        identity = _identity_from_stat(initial_stat)
+        file_size = identity.size
+        if file_size < 8:
+            raise ValueError("safetensor file is too short for its header length")
         prefix = _pread_exact(fd, 8, 0, "safetensor header length")
         (header_length,) = struct.unpack("<Q", prefix)
         if header_length > _MAX_HEADER_BYTES:
@@ -157,9 +209,28 @@ def read_header(path: Path) -> SourceShard:
         if data_start > file_size:
             raise ValueError("safetensor header length extends beyond EOF")
         header_bytes = _pread_exact(fd, header_length, 8, "safetensor header")
+        shard = _parse_header(
+            header_bytes,
+            source_path,
+            header_length,
+            data_start,
+            file_size,
+            identity,
+        )
+        _require_stable_identity(identity, os.fstat(fd), "safetensor header")
+        return shard
     finally:
         os.close(fd)
 
+
+def _parse_header(
+    header_bytes: bytes,
+    source_path: Path,
+    header_length: int,
+    data_start: int,
+    file_size: int,
+    identity: _SourceIdentity,
+) -> SourceShard:
     try:
         header_text = header_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -216,6 +287,7 @@ def read_header(path: Path) -> SourceShard:
                 start=data_start + relative_start,
                 end=data_start + relative_end,
                 nbytes=actual_nbytes,
+                _source_identity=identity,
             )
         )
 
@@ -223,7 +295,7 @@ def read_header(path: Path) -> SourceShard:
     return SourceShard(source_path, header_length, data_start, tuple(records))
 
 
-def _validate_record(record: TensorRecord) -> None:
+def _validate_record_structure(record: TensorRecord) -> None:
     if not isinstance(record, TensorRecord):
         raise ValueError("records must contain TensorRecord values")
     _validate_name(record.name)
@@ -243,31 +315,105 @@ def _validate_record(record: TensorRecord) -> None:
         raise ValueError(f"tensor {record.name!r} offset order is invalid")
     if end - start != nbytes or nbytes != expected_nbytes:
         raise ValueError(f"tensor {record.name!r} nbytes is inconsistent with offsets, dtype, or shape")
-    source_stat = record.source_file.stat()
-    if not stat.S_ISREG(source_stat.st_mode):
-        raise ValueError(f"tensor {record.name!r} source is not a regular file")
-    if end > source_stat.st_size:
+
+
+def _validate_record_source(record: TensorRecord, identity: _SourceIdentity) -> None:
+    if record._source_identity is not None and record._source_identity != identity:
+        raise ValueError(f"tensor {record.name!r} source identity changed")
+    if record.end > identity.size:
         raise ValueError(f"tensor {record.name!r} source range extends beyond EOF")
 
 
-def _validate_records(records: Sequence[TensorRecord]) -> tuple[TensorRecord, ...]:
+def _validate_record_structures(
+    records: Sequence[TensorRecord],
+) -> tuple[TensorRecord, ...]:
     values = tuple(records)
     names: set[str] = set()
-    by_source: dict[Path, list[TensorRecord]] = {}
     for record in values:
-        _validate_record(record)
+        _validate_record_structure(record)
         if record.name in names:
             raise ValueError(f"duplicate tensor name: {record.name}")
         names.add(record.name)
-        by_source.setdefault(record.source_file, []).append(record)
-    for source_records in by_source.values():
-        ordered = sorted(source_records, key=lambda item: (item.start, item.end, item.name))
-        previous_end = 0
-        for record in ordered:
-            if record.start < previous_end:
-                raise ValueError(f"tensor {record.name!r} source range overlaps another tensor")
-            previous_end = max(previous_end, record.end)
     return values
+
+
+def _open_source_handles(
+    records: Sequence[TensorRecord],
+) -> tuple[dict[Path, _SourceHandle], dict[tuple[int, int], _SourceHandle]]:
+    by_path: dict[Path, _SourceHandle] = {}
+    by_inode: dict[tuple[int, int], _SourceHandle] = {}
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        for source_path in dict.fromkeys(record.source_file for record in records):
+            source_fd = os.open(source_path, flags)
+            try:
+                source_stat = os.fstat(source_fd)
+                if not stat.S_ISREG(source_stat.st_mode):
+                    raise ValueError(f"source {source_path} is not a regular file")
+                identity = _identity_from_stat(source_stat)
+                inode_key = (identity.device, identity.inode)
+                handle = by_inode.get(inode_key)
+                if handle is None:
+                    handle = _SourceHandle(source_fd, identity)
+                    by_inode[inode_key] = handle
+                    source_fd = -1
+                elif handle.identity != identity:
+                    raise ValueError(f"source {source_path} changed while aliases were opened")
+                by_path[source_path] = handle
+            finally:
+                if source_fd >= 0:
+                    os.close(source_fd)
+
+        ranges_by_inode: dict[tuple[int, int], list[TensorRecord]] = {}
+        for record in records:
+            handle = by_path[record.source_file]
+            _validate_record_source(record, handle.identity)
+            inode_key = (handle.identity.device, handle.identity.inode)
+            ranges_by_inode.setdefault(inode_key, []).append(record)
+        for source_records in ranges_by_inode.values():
+            ordered = sorted(
+                source_records, key=lambda item: (item.start, item.end, item.name)
+            )
+            previous_end = 0
+            for record in ordered:
+                if record.start < previous_end:
+                    raise ValueError(
+                        f"tensor {record.name!r} source range overlaps another tensor"
+                    )
+                previous_end = max(previous_end, record.end)
+        return by_path, by_inode
+    except BaseException:
+        for handle in by_inode.values():
+            try:
+                os.close(handle.fd)
+            except OSError:
+                pass
+        raise
+
+
+def _validate_open_sources(handles: Mapping[tuple[int, int], _SourceHandle]) -> None:
+    for handle in handles.values():
+        _require_stable_identity(
+            handle.identity, os.fstat(handle.fd), "safetensor payload"
+        )
+
+
+def _close_source_handles(
+    handles: Mapping[tuple[int, int], _SourceHandle], error: BaseException | None = None
+) -> None:
+    first_error: OSError | None = None
+    for handle in handles.values():
+        try:
+            os.close(handle.fd)
+        except OSError as exc:
+            if error is not None:
+                error.add_note(f"failed to close source fd {handle.fd}: {exc}")
+            elif first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
 
 def _write_all(fd: int, data: bytes | memoryview) -> None:
@@ -285,37 +431,32 @@ def _write_all(fd: int, data: bytes | memoryview) -> None:
         written += count
 
 
-def _copy_payload_validated(
+def _copy_payload_from_fd(
     record: TensorRecord,
+    source_fd: int,
     dst_fd: int,
     chunk_bytes: int,
     shard_hasher: Any | None = None,
 ) -> str:
     payload_hasher = hashlib.sha256()
-    source_fd = os.open(record.source_file, os.O_RDONLY)
-    try:
-        if record.end > os.fstat(source_fd).st_size:
-            raise OSError(f"truncated payload source for tensor {record.name!r}")
-        offset = record.start
-        remaining = record.nbytes
-        while remaining:
-            request = min(chunk_bytes, remaining)
-            try:
-                chunk = os.pread(source_fd, request, offset)
-            except InterruptedError:
-                continue
-            if not chunk:
-                raise OSError(f"truncated payload read for tensor {record.name!r}")
-            if len(chunk) > request:
-                raise OSError(f"oversized payload read for tensor {record.name!r}")
-            _write_all(dst_fd, chunk)
-            payload_hasher.update(chunk)
-            if shard_hasher is not None:
-                shard_hasher.update(chunk)
-            offset += len(chunk)
-            remaining -= len(chunk)
-    finally:
-        os.close(source_fd)
+    offset = record.start
+    remaining = record.nbytes
+    while remaining:
+        request = min(chunk_bytes, remaining)
+        try:
+            chunk = os.pread(source_fd, request, offset)
+        except InterruptedError:
+            continue
+        if not chunk:
+            raise OSError(f"truncated payload read for tensor {record.name!r}")
+        if len(chunk) > request:
+            raise OSError(f"oversized payload read for tensor {record.name!r}")
+        _write_all(dst_fd, chunk)
+        payload_hasher.update(chunk)
+        if shard_hasher is not None:
+            shard_hasher.update(chunk)
+        offset += len(chunk)
+        remaining -= len(chunk)
     return payload_hasher.hexdigest()
 
 
@@ -334,8 +475,25 @@ def copy_payload(
         )
     if type(dst_fd) is not int or dst_fd < 0:
         raise ValueError("dst_fd must be a non-negative integer file descriptor")
-    _validate_record(record)
-    return _copy_payload_validated(record, dst_fd, chunk_bytes)
+    _validate_record_structure(record)
+    source_fd = os.open(record.source_file, os.O_RDONLY)
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError(f"tensor {record.name!r} source is not a regular file")
+        identity = _identity_from_stat(source_stat)
+        _validate_record_source(record, identity)
+        destination_stat = os.fstat(dst_fd)
+        if stat.S_ISREG(destination_stat.st_mode) and (
+            destination_stat.st_dev,
+            destination_stat.st_ino,
+        ) == (identity.device, identity.inode):
+            raise ValueError("source and destination refer to the same file")
+        digest = _copy_payload_from_fd(record, source_fd, dst_fd, chunk_bytes)
+        _require_stable_identity(identity, os.fstat(source_fd), "tensor payload")
+        return digest
+    finally:
+        os.close(source_fd)
 
 
 def _build_output_layout(
@@ -358,6 +516,8 @@ def _build_output_layout(
         sort_keys=True,
     ).encode("utf-8")
     header_bytes = compact + (b" " * (-len(compact) % 8))
+    if len(header_bytes) > _MAX_HEADER_BYTES:
+        raise ValueError("padded safetensor header exceeds the safety limit")
     data_start = 8 + len(header_bytes)
 
     output_records: list[TensorRecord] = []
@@ -380,52 +540,90 @@ def _build_output_layout(
     return header_bytes, data_start, tuple(output_records)
 
 
+def _close_fd_with_note(fd: int, label: str, error: BaseException) -> None:
+    try:
+        os.close(fd)
+    except OSError as close_error:
+        error.add_note(f"failed to close {label} fd {fd}: {close_error}")
+
+
+def _cleanup_created_output(
+    output_path: Path, created_identity: _SourceIdentity, error: BaseException
+) -> None:
+    try:
+        current_stat = os.lstat(output_path)
+    except FileNotFoundError:
+        error.add_note("partial output not removed because its pathname no longer exists")
+        return
+    except OSError as stat_error:
+        error.add_note(f"could not inspect partial output before cleanup: {stat_error}")
+        return
+    if (current_stat.st_dev, current_stat.st_ino) != (
+        created_identity.device,
+        created_identity.inode,
+    ):
+        error.add_note(
+            "partial output not removed because the pathname no longer identifies "
+            "the writer-created inode"
+        )
+        return
+    try:
+        os.unlink(output_path)
+    except OSError as unlink_error:
+        error.add_note(f"failed to remove writer-created partial output: {unlink_error}")
+
+
 def write_shard(records: Sequence[TensorRecord], output_tmp: Path) -> ShardResult:
     output_path = Path(output_tmp)
     if output_path.suffix != ".tmp":
         raise ValueError("output path must have an explicit .tmp suffix")
 
-    validated = _validate_records(records)
+    validated = _validate_record_structures(records)
     ordered = tuple(sorted(validated, key=lambda record: record.name))
     header_bytes, data_start, output_records = _build_output_layout(ordered, output_path)
     prefix = struct.pack("<Q", len(header_bytes))
     file_hasher = hashlib.sha256()
     payload_hashes: list[tuple[str, str]] = []
     output_fd: int | None = None
-    created = False
+    created_identity: _SourceIdentity | None = None
+    sources_by_path: dict[Path, _SourceHandle] = {}
+    sources_by_inode: dict[tuple[int, int], _SourceHandle] = {}
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
 
     try:
+        sources_by_path, sources_by_inode = _open_source_handles(ordered)
         output_fd = os.open(output_path, flags, 0o600)
-        created = True
+        output_stat = os.fstat(output_fd)
+        created_identity = _identity_from_stat(output_stat)
+        if (output_stat.st_dev, output_stat.st_ino) in sources_by_inode:
+            raise ValueError("output and source refer to the same file")
         _write_all(output_fd, prefix)
         file_hasher.update(prefix)
         _write_all(output_fd, header_bytes)
         file_hasher.update(header_bytes)
         for record in ordered:
-            digest = _copy_payload_validated(
+            digest = _copy_payload_from_fd(
                 record,
+                sources_by_path[record.source_file].fd,
                 output_fd,
                 MAX_COPY_CHUNK_BYTES,
                 file_hasher,
             )
             payload_hashes.append((record.name, digest))
         os.fsync(output_fd)
+        _validate_open_sources(sources_by_inode)
         os.close(output_fd)
         output_fd = None
-    except BaseException:
+        _close_source_handles(sources_by_inode)
+        sources_by_inode = {}
+    except BaseException as error:
         if output_fd is not None:
-            try:
-                os.close(output_fd)
-            except OSError:
-                pass
-        if created:
-            try:
-                output_path.unlink()
-            except FileNotFoundError:
-                pass
+            _close_fd_with_note(output_fd, "output", error)
+        _close_source_handles(sources_by_inode, error)
+        if created_identity is not None:
+            _cleanup_created_output(output_path, created_identity, error)
         raise
 
     file_size = data_start + sum(record.nbytes for record in ordered)
