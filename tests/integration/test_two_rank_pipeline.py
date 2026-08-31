@@ -826,9 +826,27 @@ def test_ring_launch_lock_has_a_bounded_contention_failure(tmp_path: Path) -> No
 
 def test_pure_lock_is_isolated_while_global_ring_lock_is_held(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with _ring_launch_lock(_Deadline(1.0), RING_LOCK_PATH):
-        with _ring_launch_lock(_Deadline(1.0), tmp_path / "isolated.lock"):
+    production_lock = RING_LOCK_PATH
+    original_lock = _ring_launch_lock
+
+    @contextmanager
+    def reject_production_lock(
+        deadline: _Deadline, lock_path: Path
+    ) -> Iterator[None]:
+        assert lock_path != production_lock, "pure test opened the production Ring lock"
+        with original_lock(deadline, lock_path):
+            yield
+
+    monkeypatch.setattr(
+        "test_two_rank_pipeline._ring_launch_lock", reject_production_lock
+    )
+    simulated_global_lock = tmp_path / "simulated-global.lock"
+    isolated_lock = tmp_path / "isolated.lock"
+    assert simulated_global_lock != isolated_lock
+    with _ring_launch_lock(_Deadline(1.0), simulated_global_lock):
+        with _ring_launch_lock(_Deadline(1.0), isolated_lock):
             assert True
 
 
