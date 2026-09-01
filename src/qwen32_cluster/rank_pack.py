@@ -28,6 +28,12 @@ FINAL_MANIFEST_NAME = "rank-manifest.json"
 STAGING_MANIFEST_NAME = "rank-manifest.json.staging"
 DEFAULT_MAX_SHARD_BYTES = 768 << 20
 FORMAT_VERSION = 1
+_OWNER_TOKEN_BYTES = 32
+_OWNER_XATTR = (
+    b"com.openai.qwen32-cluster.owner"
+    if sys.platform == "darwin"
+    else b"user.qwen32_cluster.owner"
+)
 
 _LAYER_KEY = re.compile(r"^model\.layers\.(0|[1-9][0-9]*)\.(.+)$")
 _TENSOR_SUFFIX = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$")
@@ -1060,7 +1066,173 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _publish_bytes(path: Path, payload: bytes, *, replace: bool = False) -> FileSnapshot:
+def _validate_owner_token(owner_token: bytes) -> None:
+    if not isinstance(owner_token, bytes) or len(owner_token) != _OWNER_TOKEN_BYTES:
+        raise ValueError("rank pack owner token is invalid")
+
+
+def _set_fd_owner(fd: int, owner_token: bytes) -> None:
+    _validate_owner_token(owner_token)
+    library = ctypes.CDLL(None, use_errno=True)
+    name = ctypes.c_char_p(_OWNER_XATTR)
+    value = ctypes.create_string_buffer(owner_token)
+    if sys.platform == "darwin":
+        function = library.fsetxattr
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_int,
+        )
+        function.restype = ctypes.c_int
+        result = function(fd, name, value, len(owner_token), 0, 0x0002)
+    elif sys.platform.startswith("linux"):
+        function = library.fsetxattr
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        )
+        function.restype = ctypes.c_int
+        result = function(fd, name, value, len(owner_token), 0x0001)
+    else:
+        raise OSError(errno.ENOTSUP, "rank pack inode ownership is unavailable")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _get_fd_owner(fd: int) -> bytes | None:
+    library = ctypes.CDLL(None, use_errno=True)
+    name = ctypes.c_char_p(_OWNER_XATTR)
+    if sys.platform == "darwin":
+        function = library.fgetxattr
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_int,
+        )
+        function.restype = ctypes.c_ssize_t
+
+        def read(value: ctypes.Array[ctypes.c_char] | None, size: int) -> int:
+            return int(function(fd, name, value, size, 0, 0))
+
+    elif sys.platform.startswith("linux"):
+        function = library.fgetxattr
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        )
+        function.restype = ctypes.c_ssize_t
+
+        def read(value: ctypes.Array[ctypes.c_char] | None, size: int) -> int:
+            return int(function(fd, name, value, size))
+
+    else:
+        raise OSError(errno.ENOTSUP, "rank pack inode ownership is unavailable")
+    size = read(None, 0)
+    if size < 0:
+        error_number = ctypes.get_errno()
+        missing = {errno.ENODATA}
+        if hasattr(errno, "ENOATTR"):
+            missing.add(errno.ENOATTR)
+        if error_number in missing:
+            return None
+        raise OSError(error_number, os.strerror(error_number))
+    if size != _OWNER_TOKEN_BYTES:
+        return None
+    value = ctypes.create_string_buffer(size)
+    result = read(value, size)
+    if result < 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if result != size:
+        return None
+    return bytes(value.raw[:result])
+
+
+def _open_snapshot(path: Path, snapshot: FileSnapshot, label: str, *, writable: bool) -> int:
+    flags = os.O_RDWR if writable else os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"{label} changed before ownership validation") from exc
+    value = os.fstat(fd)
+    if not stat.S_ISREG(value.st_mode) or (value.st_dev, value.st_ino) != (
+        snapshot.device,
+        snapshot.inode,
+    ):
+        os.close(fd)
+        raise ValueError(f"{label} changed before ownership validation")
+    return fd
+
+
+def _tag_owned_file(
+    path: Path, snapshot: FileSnapshot, owner_token: bytes, label: str
+) -> FileSnapshot:
+    fd = _open_snapshot(path, snapshot, label, writable=True)
+    try:
+        _set_fd_owner(fd, owner_token)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    current = _hash_regular_file(path, label)
+    if (
+        (current.device, current.inode, current.size)
+        != (snapshot.device, snapshot.inode, snapshot.size)
+        or current.sha256 != snapshot.sha256
+    ):
+        raise ValueError(f"{label} changed while recording transaction ownership")
+    return current
+
+
+def _require_path_owner(
+    path: Path, snapshot: FileSnapshot, owner_token: bytes, label: str
+) -> None:
+    _validate_owner_token(owner_token)
+    fd = _open_snapshot(path, snapshot, label, writable=False)
+    try:
+        actual = _get_fd_owner(fd)
+    finally:
+        os.close(fd)
+    if actual != owner_token:
+        raise ValueError(
+            f"{label} changed or is not owned by this rank pack transaction"
+        )
+
+
+def _read_path_owner(path: Path, snapshot: FileSnapshot, label: str) -> bytes:
+    fd = _open_snapshot(path, snapshot, label, writable=False)
+    try:
+        owner_token = _get_fd_owner(fd)
+    finally:
+        os.close(fd)
+    if owner_token is None:
+        raise ValueError(f"{label} has no rank pack transaction ownership")
+    _validate_owner_token(owner_token)
+    return owner_token
+
+
+def _publish_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    replace: bool = False,
+    owner_token: bytes,
+) -> FileSnapshot:
     if not isinstance(payload, bytes):
         raise ValueError("published payload must be bytes")
     if replace:
@@ -1075,13 +1247,26 @@ def _publish_bytes(path: Path, payload: bytes, *, replace: bool = False) -> File
         fd = os.open(temporary, flags, 0o600)
         temporary_snapshot = _snapshot_from_stat(temporary, os.fstat(fd), None)
         _write_all(fd, payload)
+        _set_fd_owner(fd, owner_token)
         os.fsync(fd)
         os.close(fd)
         fd = None
         published_snapshot = _hash_regular_file(temporary, f"metadata {path.name!r}")
+        if (published_snapshot.device, published_snapshot.inode) != (
+            temporary_snapshot.device,
+            temporary_snapshot.inode,
+        ):
+            raise ValueError(f"metadata temporary {path.name!r} changed before publication")
+        _require_path_owner(
+            temporary,
+            published_snapshot,
+            owner_token,
+            f"metadata temporary {path.name!r}",
+        )
         _rename_no_replace(temporary, path)
         _fsync_directory(path.parent)
         _validate_published_file(path, published_snapshot, f"metadata {path.name!r}")
+        _require_path_owner(path, published_snapshot, owner_token, f"metadata {path.name!r}")
         return published_snapshot
     except BaseException as error:
         if fd is not None:
@@ -1306,8 +1491,11 @@ def _validate_payload_files(plan: RankPackPlan, expected_names: set[str]) -> Non
 
 
 def _validate_recovery_artifact(
-    plan: RankPackPlan, name: str, snapshot: FileSnapshot
+    plan: RankPackPlan, name: str, snapshot: FileSnapshot, owner_token: bytes
 ) -> None:
+    _require_path_owner(
+        snapshot.path, snapshot, owner_token, f"owned staging path {name!r}"
+    )
     _validate_snapshot(snapshot, f"owned staging path {name!r}")
     logical_name = name[:-4] if name.endswith(".tmp") else name
     expected_payloads = {
@@ -1365,6 +1553,33 @@ def _validate_published_file(
 
 def _validate_published_shard(path: Path, snapshot: FileSnapshot) -> None:
     _validate_published_file(path, snapshot, f"published shard {path.name!r}")
+
+
+def _validate_final_manifest(
+    path: Path, snapshot: FileSnapshot, owner_token: bytes
+) -> None:
+    try:
+        _validate_published_file(path, snapshot, "final rank manifest")
+        _require_path_owner(path, snapshot, owner_token, "final rank manifest")
+    except ValueError as exc:
+        raise RuntimeError(
+            "final manifest identity, content, or ownership changed during publication"
+        ) from exc
+
+
+def _validate_completed_ownership(
+    plan: RankPackPlan, expected_names: set[str]
+) -> None:
+    final = plan.output_dir / FINAL_MANIFEST_NAME
+    _, final_snapshot = _read_regular(final, "completed rank manifest")
+    owner_token = _read_path_owner(final, final_snapshot, "completed rank manifest")
+    for name in sorted(expected_names):
+        path = plan.output_dir / name
+        value = os.lstat(path)
+        snapshot = _snapshot_from_stat(path, value, None)
+        _require_path_owner(
+            path, snapshot, owner_token, f"completed rank pack path {name!r}"
+        )
 
 
 def _validate_staged_output(plan: RankPackPlan, expected: RankManifest) -> None:
@@ -1508,6 +1723,17 @@ def _prepare_output(plan: RankPackPlan, expected: RankManifest, force: bool) -> 
         if parsed != expected:
             raise FileExistsError("completed output belongs to a different rank pack plan")
         _validate_completed_output(plan, expected)
+        if not force:
+            raise FileExistsError("completed output requires force for idempotent reuse")
+        expected_names = {
+            *(shard.filename for shard in plan.shards),
+            *(asset.name for asset in plan.assets),
+            ADAPTER_NAME,
+            CONFIG_NAME,
+            INDEX_NAME,
+            FINAL_MANIFEST_NAME,
+        }
+        _validate_completed_ownership(plan, expected_names)
         return parsed
     entries = {entry.name for entry in os.scandir(output)}
     if not entries:
@@ -1527,10 +1753,18 @@ def _prepare_output(plan: RankPackPlan, expected: RankManifest, force: bool) -> 
         )
         if temporary_marker != expected.to_dict():
             raise ValueError("staging rank manifest temporary does not match this plan")
+        owner_token = _read_path_owner(
+            staging_temporary,
+            temporary_snapshot,
+            "staging rank manifest temporary",
+        )
         _rename_no_replace(staging_temporary, staging)
         if not _path_identifies_snapshot(staging, temporary_snapshot):
             raise ValueError("staging rank manifest temporary changed during recovery")
         _fsync_directory(output)
+        _require_path_owner(
+            staging, temporary_snapshot, owner_token, "staging rank manifest"
+        )
         entries = {entry.name for entry in os.scandir(output)}
     marker_payload, marker_snapshot = _read_regular(staging, "staging rank manifest")
     marker = _load_json_bytes(marker_payload, STAGING_MANIFEST_NAME)
@@ -1541,6 +1775,7 @@ def _prepare_output(plan: RankPackPlan, expected: RankManifest, force: bool) -> 
     expected_value["state"] = marker_state
     if marker != expected_value:
         raise ValueError("staging marker does not match this plan")
+    owner_token = _read_path_owner(staging, marker_snapshot, "staging rank manifest")
     allowed = set(expected.managed_files) - {FINAL_MANIFEST_NAME}
     unknown = entries - allowed
     if unknown:
@@ -1556,7 +1791,7 @@ def _prepare_output(plan: RankPackPlan, expected: RankManifest, force: bool) -> 
     _validate_snapshot(marker_snapshot, "staging rank manifest")
     for name, snapshot in content_snapshots.items():
         _validate_snapshot(marker_snapshot, "staging rank manifest")
-        _validate_recovery_artifact(plan, name, snapshot)
+        _validate_recovery_artifact(plan, name, snapshot, owner_token)
         os.unlink(snapshot.path)
     _validate_snapshot(marker_snapshot, "staging rank manifest")
     remaining = {entry.name for entry in os.scandir(output)}
@@ -1581,60 +1816,110 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
         return existing
     output = plan.output_dir
     staging = output / STAGING_MANIFEST_NAME
-    _publish_bytes(staging, _manifest_bytes(expected, "complete"))
+    owner_token = os.urandom(_OWNER_TOKEN_BYTES)
+    staging_snapshot = _publish_bytes(
+        staging,
+        _manifest_bytes(expected, "complete"),
+        owner_token=owner_token,
+    )
     published_shards: list[tuple[Path, FileSnapshot]] = []
     published_metadata: list[tuple[Path, FileSnapshot]] = []
     for shard in plan.shards:
         temporary = output / f"{shard.filename}.tmp"
         result = write_shard(shard.tensors, temporary)
+        writer_snapshot = _snapshot_regular(
+            temporary, f"written shard {shard.filename!r}"
+        )
         temporary_snapshot = _hash_regular_file(temporary, f"shard {shard.filename!r}")
         if (
             result.path != temporary
             or result.file_size != temporary_snapshot.size
             or result.sha256 != temporary_snapshot.sha256
+            or (writer_snapshot.device, writer_snapshot.inode)
+            != (temporary_snapshot.device, temporary_snapshot.inode)
         ):
             raise ValueError(f"written shard {shard.filename!r} changed before publication")
+        temporary_snapshot = _tag_owned_file(
+            temporary,
+            temporary_snapshot,
+            owner_token,
+            f"written shard {shard.filename!r}",
+        )
         final = output / shard.filename
         _rename_no_replace(temporary, final)
         if not _path_identifies_snapshot(final, temporary_snapshot):
             raise ValueError(f"written shard {shard.filename!r} changed during publication")
         _fsync_directory(output)
         _validate_published_shard(final, temporary_snapshot)
+        _require_path_owner(
+            final,
+            temporary_snapshot,
+            owner_token,
+            f"published shard {shard.filename!r}",
+        )
         published_shards.append((final, temporary_snapshot))
     for asset in plan.assets:
         asset_path = output / asset.name
         published_metadata.append(
-            (asset_path, _publish_bytes(asset_path, asset.payload))
+            (
+                asset_path,
+                _publish_bytes(asset_path, asset.payload, owner_token=owner_token),
+            )
         )
     adapter_path = output / ADAPTER_NAME
     config_path = output / CONFIG_NAME
     index_path = output / INDEX_NAME
     published_metadata.extend(
         (
-            (adapter_path, _publish_bytes(adapter_path, plan.adapter_bytes)),
-            (config_path, _publish_bytes(config_path, plan.config_bytes)),
-            (index_path, _publish_bytes(index_path, plan.index_bytes)),
+            (
+                adapter_path,
+                _publish_bytes(adapter_path, plan.adapter_bytes, owner_token=owner_token),
+            ),
+            (
+                config_path,
+                _publish_bytes(config_path, plan.config_bytes, owner_token=owner_token),
+            ),
+            (
+                index_path,
+                _publish_bytes(index_path, plan.index_bytes, owner_token=owner_token),
+            ),
         )
     )
     _validate_plan_sources(plan)
     _validate_staged_output(plan, expected)
     for shard_path, shard_snapshot in published_shards:
         _validate_published_shard(shard_path, shard_snapshot)
+        _require_path_owner(
+            shard_path,
+            shard_snapshot,
+            owner_token,
+            f"published shard {shard_path.name!r}",
+        )
     for metadata_path, metadata_snapshot in published_metadata:
         _validate_published_file(
             metadata_path, metadata_snapshot, f"published metadata {metadata_path.name!r}"
         )
+        _require_path_owner(
+            metadata_path,
+            metadata_snapshot,
+            owner_token,
+            f"published metadata {metadata_path.name!r}",
+        )
     final = output / FINAL_MANIFEST_NAME
     if final.exists() or final.is_symlink():
         raise FileExistsError("refusing to overwrite final rank manifest")
-    _, staging_snapshot = _read_regular(staging, "complete staging rank manifest")
+    _validate_published_file(staging, staging_snapshot, "complete staging rank manifest")
+    _require_path_owner(
+        staging,
+        staging_snapshot,
+        owner_token,
+        "complete staging rank manifest",
+    )
     try:
         _rename_no_replace(staging, final)
-        if not _path_identifies_snapshot(final, staging_snapshot):
-            raise RuntimeError("final manifest identity changed during publication")
+        _validate_final_manifest(final, staging_snapshot, owner_token)
         _fsync_directory(output)
-        if not _path_identifies_snapshot(final, staging_snapshot):
-            raise RuntimeError("final manifest identity changed during publication fsync")
+        _validate_final_manifest(final, staging_snapshot, owner_token)
     except BaseException as error:
         _rollback_final_manifest(staging, final, staging_snapshot, error)
         raise

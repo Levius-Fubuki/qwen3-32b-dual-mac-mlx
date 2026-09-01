@@ -377,6 +377,28 @@ def test_fresh_packs_are_byte_deterministic_and_completed_pack_is_idempotent(tmp
     assert _tree_hashes(outputs[0]) == before
 
 
+def test_completed_output_requires_force_for_idempotent_reuse(tmp_path: Path) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    manifest = module.pack_rank(plan)
+
+    with pytest.raises(FileExistsError, match="force|nonempty|completed"):
+        module.pack_rank(plan)
+    assert module.pack_rank(plan, force=True) == manifest
+
+    config = output / module.CONFIG_NAME
+    payload = config.read_bytes()
+    os.replace(config, tmp_path / "displaced-owned-config")
+    config.write_bytes(payload)
+    replacement = os.lstat(config)
+    with pytest.raises(ValueError, match="owned|ownership|transaction"):
+        module.pack_rank(plan, force=True)
+    current = os.lstat(config)
+    assert (current.st_dev, current.st_ino) == (replacement.st_dev, replacement.st_ino)
+
+
 def test_idempotence_rejects_changed_output_tensor_descriptors(tmp_path: Path) -> None:
     module = rank_pack()
     source = _source_model(tmp_path / "source")
@@ -486,9 +508,9 @@ def test_interruption_leaves_matching_staging_marker_and_no_final_manifest(
     else:
         original = module._publish_bytes
 
-        def fail_boundary(path, payload, *, replace=False):
+        def fail_boundary(path, payload, *, replace=False, owner_token):
             if boundary == "manifest" and path.name == module.STAGING_MANIFEST_NAME:
-                original(path, payload, replace=replace)
+                original(path, payload, replace=replace, owner_token=owner_token)
                 raise failure
             if (
                 (boundary == "asset" and path.name == "tokenizer.json")
@@ -496,7 +518,7 @@ def test_interruption_leaves_matching_staging_marker_and_no_final_manifest(
                 or (boundary == "index" and path.name == "model.safetensors.index.json")
             ):
                 raise failure
-            return original(path, payload, replace=replace)
+            return original(path, payload, replace=replace, owner_token=owner_token)
 
         monkeypatch.setattr(module, "_publish_bytes", fail_boundary)
 
@@ -726,6 +748,108 @@ def test_shard_publication_rejects_a_replaced_writer_temporary(
     assert marker["plan_id"] == plan.plan_id
 
 
+def test_shard_hash_rejects_a_same_bytes_writer_inode_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_hash = module._hash_regular_file
+    displaced = tmp_path / "displaced-tool-shard-tmp"
+    replacement_inode: tuple[int, int] | None = None
+
+    def replace_before_shard_hash(path: Path, label: str):
+        nonlocal replacement_inode
+        if replacement_inode is None and path.name.endswith(".safetensors.tmp"):
+            payload = path.read_bytes()
+            os.replace(path, displaced)
+            path.write_bytes(payload)
+            value = os.lstat(path)
+            replacement_inode = (value.st_dev, value.st_ino)
+        return original_hash(path, label)
+
+    monkeypatch.setattr(module, "_hash_regular_file", replace_before_shard_hash)
+    with pytest.raises(ValueError, match="shard|writer|changed"):
+        module.pack_rank(plan)
+
+    shard_tmp = output / f"{plan.shards[0].filename}.tmp"
+    assert replacement_inode is not None
+    current = os.lstat(shard_tmp)
+    assert (current.st_dev, current.st_ino) == replacement_inode
+    assert displaced.is_file()
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+
+
+def test_force_preserves_same_bytes_shard_destination_collision_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_rename = module._rename_no_replace
+    collided: Path | None = None
+    collision_inode: tuple[int, int] | None = None
+
+    def collide_with_same_bytes(source_path, destination_path) -> None:
+        nonlocal collided, collision_inode
+        source_value = Path(source_path)
+        destination_value = Path(destination_path)
+        if destination_value.suffix == ".safetensors":
+            destination_value.write_bytes(source_value.read_bytes())
+            value = os.lstat(destination_value)
+            collided = destination_value
+            collision_inode = (value.st_dev, value.st_ino)
+        original_rename(source_path, destination_path)
+
+    monkeypatch.setattr(module, "_rename_no_replace", collide_with_same_bytes)
+    with pytest.raises(FileExistsError):
+        module.pack_rank(plan)
+
+    assert collided is not None and collision_inode is not None
+    monkeypatch.setattr(module, "_rename_no_replace", original_rename)
+    with pytest.raises(ValueError, match="owned|ownership|transaction"):
+        module.pack_rank(plan, force=True)
+
+    current = os.lstat(collided)
+    assert (current.st_dev, current.st_ino) == collision_inode
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+
+
+def test_metadata_temporary_same_bytes_inode_replacement_is_not_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_hash = module._hash_regular_file
+    displaced = tmp_path / "displaced-tool-config-tmp"
+    replacement_inode: tuple[int, int] | None = None
+
+    def replace_before_metadata_hash(path: Path, label: str):
+        nonlocal replacement_inode
+        if replacement_inode is None and path.name == "config.json.tmp":
+            payload = path.read_bytes()
+            os.replace(path, displaced)
+            path.write_bytes(payload)
+            value = os.lstat(path)
+            replacement_inode = (value.st_dev, value.st_ino)
+        return original_hash(path, label)
+
+    monkeypatch.setattr(module, "_hash_regular_file", replace_before_metadata_hash)
+    with pytest.raises(ValueError, match="metadata|temporary|changed"):
+        module.pack_rank(plan)
+
+    config_tmp = output / "config.json.tmp"
+    assert replacement_inode is not None
+    current = os.lstat(config_tmp)
+    assert (current.st_dev, current.st_ino) == replacement_inode
+    assert displaced.is_file()
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+
+
 def test_force_preserves_an_unrelated_shard_temporary_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -773,6 +897,13 @@ def test_force_promotes_a_complete_staging_temporary_but_preserves_foreign_tmp(
     valid_tmp = valid_output / f"{module.STAGING_MANIFEST_NAME}.tmp"
     valid_tmp.write_bytes(
         module._manifest_bytes(module._manifest_for(valid_plan), "complete")
+    )
+    valid_snapshot = module._hash_regular_file(valid_tmp, "valid staging temporary")
+    module._tag_owned_file(
+        valid_tmp,
+        valid_snapshot,
+        os.urandom(module._OWNER_TOKEN_BYTES),
+        "valid staging temporary",
     )
 
     manifest = module.pack_rank(valid_plan, force=True)
@@ -862,6 +993,39 @@ def test_metadata_replacement_after_staged_validation_blocks_final_manifest(
 
     assert injected
     assert (output / target_name).read_bytes() == hostile
+    assert displaced.is_file()
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+
+
+def test_same_bytes_staging_inode_replacement_is_not_adopted_as_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_validate = module._validate_staged_output
+    displaced = tmp_path / "displaced-tool-staging"
+    replacement_inode: tuple[int, int] | None = None
+
+    def replace_marker_after_validation(plan_value, expected) -> None:
+        nonlocal replacement_inode
+        original_validate(plan_value, expected)
+        marker = output / module.STAGING_MANIFEST_NAME
+        payload = marker.read_bytes()
+        os.replace(marker, displaced)
+        marker.write_bytes(payload)
+        value = os.lstat(marker)
+        replacement_inode = (value.st_dev, value.st_ino)
+
+    monkeypatch.setattr(module, "_validate_staged_output", replace_marker_after_validation)
+    with pytest.raises(ValueError, match="staging|changed|publication"):
+        module.pack_rank(plan)
+
+    marker = output / module.STAGING_MANIFEST_NAME
+    assert replacement_inode is not None
+    current = os.lstat(marker)
+    assert (current.st_dev, current.st_ino) == replacement_inode
     assert displaced.is_file()
     assert not (output / module.FINAL_MANIFEST_NAME).exists()
 
@@ -1229,8 +1393,10 @@ def test_unknown_file_race_prevents_final_manifest_publication(
     plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
     original = module._publish_bytes
 
-    def inject_after_index(path: Path, payload: bytes, *, replace: bool = False) -> None:
-        original(path, payload, replace=replace)
+    def inject_after_index(
+        path: Path, payload: bytes, *, replace: bool = False, owner_token: bytes
+    ) -> None:
+        original(path, payload, replace=replace, owner_token=owner_token)
         if path.name == "model.safetensors.index.json":
             (path.parent / "intruder.txt").write_text("user data", encoding="utf-8")
 
