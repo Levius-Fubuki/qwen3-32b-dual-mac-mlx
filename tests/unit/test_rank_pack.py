@@ -143,6 +143,25 @@ def test_module_units_and_reverse_rank_selection_are_exact() -> None:
     assert all(shared in rank1 and shared in rank0 for shared in weight_map if not shared.startswith("model.layers."))
 
 
+def test_plan_accepts_upstream_total_parameters_metadata(tmp_path: Path) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    index_path = source / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["metadata"]["total_parameters"] = 32_768_000_000
+    index_path.write_text(json.dumps(index, sort_keys=True), encoding="utf-8")
+
+    plan = module.plan_rank_pack(
+        source,
+        tmp_path / "output",
+        _profile(),
+        rank=1,
+        max_shard_bytes=512,
+    )
+
+    assert plan.shards
+
+
 @pytest.mark.parametrize(
     ("rank", "world_size", "stage_layers", "shared_prefixes"),
     [

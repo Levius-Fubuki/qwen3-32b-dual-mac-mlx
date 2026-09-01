@@ -5,6 +5,7 @@ from typing import List, Optional, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.activations import swiglu
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.qwen3 import (
@@ -20,6 +21,29 @@ class PipelinePartition:
     stage_index: int
     start: int
     end: int
+
+
+def eval_interval_for_context(context_tokens: int) -> int:
+    if context_tokens > 2048:
+        return 1
+    return 4
+
+
+def _cache_offset(layer_cache) -> int:
+    if layer_cache is None:
+        return 0
+    batch_offset = getattr(layer_cache, "_idx", None)
+    if type(batch_offset) is int:
+        return batch_offset
+    offset = getattr(layer_cache, "offset", 0)
+    return offset if type(offset) is int else 0
+
+
+def _cache_state_values(layer_cache):
+    if layer_cache is None:
+        return ()
+    state = layer_cache.state
+    return state if isinstance(state, tuple) else (state,)
 
 
 def partition_layers(
@@ -141,8 +165,33 @@ class Qwen3PipelineModel(UpstreamQwen3Model):
         mask = create_attention_mask(h, cache[0])
         if self.pipeline_rank < self.pipeline_size - 1:
             h = mx.distributed.recv_like(h, self.pipeline_rank + 1)
-        for layer, layer_cache in zip(self.pipeline_layers, cache):
-            h = layer(h, mask, layer_cache)
+        local_layers = self.pipeline_layers
+        context_tokens = _cache_offset(cache[0]) + h.shape[1]
+        eval_interval = eval_interval_for_context(context_tokens)
+        for layer_index, (layer, layer_cache) in enumerate(
+            zip(local_layers, cache),
+            start=1,
+        ):
+            if context_tokens > 2048:
+                attention = layer.self_attn(
+                    layer.input_layernorm(h),
+                    mask,
+                    layer_cache,
+                )
+                h = h + attention
+                mx.eval(h, *_cache_state_values(layer_cache))
+                mlp_input = layer.post_attention_layernorm(h)
+                gate = layer.mlp.gate_proj(mlp_input)
+                up = layer.mlp.up_proj(mlp_input)
+                mx.eval(gate, up)
+                h = h + layer.mlp.down_proj(swiglu(gate, up))
+            else:
+                h = layer(h, mask, layer_cache)
+            if layer_index % eval_interval == 0 and layer_index < len(local_layers):
+                barrier_state = []
+                for barrier_cache in cache[layer_index - eval_interval : layer_index]:
+                    barrier_state.extend(_cache_state_values(barrier_cache))
+                mx.eval(h, *barrier_state)
         if self.pipeline_rank != 0:
             sent_h = mx.distributed.send(h, self.pipeline_rank - 1)
             if cache[-1] is not None:

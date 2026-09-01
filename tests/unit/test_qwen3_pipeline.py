@@ -258,6 +258,115 @@ def test_none_and_fully_populated_cache_forms_remain_usable() -> None:
     assert [item.offset for item in populated_cache] == [2, 2]
 
 
+def test_pipeline_materializes_hidden_state_every_four_local_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = qwen3_pipeline()
+    model = module.Model(model_args(num_layers=9))
+    tokens = mx.array([[1, 2]])
+    real_eval = mx.eval
+    materialized_shapes: list[tuple[int, ...]] = []
+
+    def record_eval(value, *values) -> None:
+        materialized_shapes.append(tuple(value.shape))
+        real_eval(value, *values)
+
+    monkeypatch.setattr(mx, "eval", record_eval)
+
+    logits = model(tokens)
+    real_eval(logits)
+
+    assert materialized_shapes == [(1, 2, 16), (1, 2, 16)]
+
+
+@pytest.mark.parametrize(
+    ("context_tokens", "expected_interval"),
+    [
+        (1, 4),
+        (2048, 4),
+        (2049, 1),
+        (4096, 1),
+        (4097, 1),
+        (8192, 1),
+    ],
+)
+def test_eval_interval_tightens_as_context_grows(
+    context_tokens: int,
+    expected_interval: int,
+) -> None:
+    module = qwen3_pipeline()
+
+    assert module.eval_interval_for_context(context_tokens) == expected_interval
+
+
+def test_pipeline_barrier_materializes_group_cache_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = qwen3_pipeline()
+    model = module.Model(model_args(num_layers=5))
+    cache = model.make_cache()
+    real_eval = mx.eval
+    evaluated_value_counts: list[int] = []
+
+    def record_eval(value, *values) -> None:
+        evaluated_value_counts.append(1 + len(values))
+        real_eval(value, *values)
+
+    monkeypatch.setattr(mx, "eval", record_eval)
+
+    hidden = model.model(mx.array([[1, 2]]), cache=cache)
+    real_eval(hidden)
+
+    assert evaluated_value_counts == [9]
+
+
+def test_long_context_splits_attention_and_mlp_projections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = qwen3_pipeline()
+    model = module.Model(model_args(num_layers=1))
+    cache = model.make_cache()
+    prior_keys = mx.zeros((1, 1, 2048, 8))
+    prior_values = mx.zeros((1, 1, 2048, 8))
+    cache[0].state = (prior_keys, prior_values)
+    real_eval = mx.eval
+    evaluated_value_counts: list[int] = []
+
+    def record_eval(value, *values) -> None:
+        evaluated_value_counts.append(1 + len(values))
+        real_eval(value, *values)
+
+    monkeypatch.setattr(mx, "eval", record_eval)
+
+    hidden = model.model(mx.array([[1]]), cache=cache)
+    real_eval(hidden)
+
+    assert evaluated_value_counts == [3, 2]
+
+
+def test_long_context_split_matches_upstream_qwen3() -> None:
+    module = qwen3_pipeline()
+    custom_args = model_args(num_layers=1)
+    upstream_args = UpstreamModelArgs.from_dict(vars(custom_args))
+    upstream = UpstreamModel(upstream_args)
+    custom = module.Model(custom_args)
+    custom.load_weights(list(tree_flatten(upstream.parameters())), strict=True)
+    upstream_cache = [KVCache() for _ in upstream.model.layers]
+    custom_cache = custom.make_cache()
+    for layer_cache in (*upstream_cache, *custom_cache):
+        layer_cache.state = (
+            mx.zeros((1, 1, 2048, custom_args.head_dim)),
+            mx.zeros((1, 1, 2048, custom_args.head_dim)),
+        )
+
+    tokens = mx.array([[1]])
+    upstream_logits = upstream(tokens, cache=upstream_cache)
+    custom_logits = custom(tokens, cache=custom_cache)
+    mx.eval(upstream_logits, custom_logits)
+
+    assert mx.allclose(upstream_logits, custom_logits, rtol=1e-5, atol=1e-5)
+
+
 def test_pipeline_rejects_non_two_rank_group_before_pruning() -> None:
     module = qwen3_pipeline()
     model = module.Model(model_args(num_layers=4, stage_layers=[3, 1]))

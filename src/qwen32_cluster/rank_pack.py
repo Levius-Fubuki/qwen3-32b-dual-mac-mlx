@@ -841,8 +841,17 @@ def plan_rank_pack(
     weight_map = index["weight_map"]
     if not isinstance(metadata, Mapping):
         raise ValueError("safetensor index metadata must be an object")
-    _require_exact_keys(metadata, {"total_size"}, "safetensor index metadata")
+    metadata_keys = {"total_size"}
+    if "total_parameters" in metadata:
+        metadata_keys.add("total_parameters")
+    _require_exact_keys(metadata, metadata_keys, "safetensor index metadata")
     _require_int(metadata["total_size"], "safetensor index total_size", minimum=0)
+    if "total_parameters" in metadata:
+        _require_int(
+            metadata["total_parameters"],
+            "safetensor index total_parameters",
+            minimum=0,
+        )
     if not isinstance(weight_map, Mapping) or not weight_map:
         raise ValueError("safetensor index weight_map must be a non-empty object")
     for key, filename in weight_map.items():
