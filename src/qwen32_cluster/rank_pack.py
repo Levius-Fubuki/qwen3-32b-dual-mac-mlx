@@ -1306,15 +1306,15 @@ def _validate_recovery_artifact(
     plan: RankPackPlan, name: str, snapshot: FileSnapshot
 ) -> None:
     _validate_snapshot(snapshot, f"owned staging path {name!r}")
-    if name.endswith(".tmp"):
-        return
+    logical_name = name[:-4] if name.endswith(".tmp") else name
     expected_payloads = {
         **{asset.name: asset.payload for asset in plan.assets},
         ADAPTER_NAME: plan.adapter_bytes,
         CONFIG_NAME: plan.config_bytes,
         INDEX_NAME: plan.index_bytes,
+        STAGING_MANIFEST_NAME: _manifest_bytes(_manifest_for(plan), "complete"),
     }
-    if name in expected_payloads:
+    if logical_name in expected_payloads:
         payload, current = _read_regular(snapshot.path, f"owned staging path {name!r}")
         current_identity = (
             current.device,
@@ -1330,10 +1330,13 @@ def _validate_recovery_artifact(
             snapshot.mtime_ns,
             snapshot.ctime_ns,
         )
-        if current_identity != snapshot_identity or payload != expected_payloads[name]:
+        if (
+            current_identity != snapshot_identity
+            or payload != expected_payloads[logical_name]
+        ):
             raise ValueError(f"owned staging path {name!r} differs from plan")
         return
-    shard = next((item for item in plan.shards if item.filename == name), None)
+    shard = next((item for item in plan.shards if item.filename == logical_name), None)
     if shard is None:
         raise ValueError(f"owned staging path {name!r} is not plan-owned")
     current = _hash_regular_file(snapshot.path, f"owned staging path {name!r}")
@@ -1343,6 +1346,16 @@ def _validate_recovery_artifact(
         or current.sha256 != _planned_shard_sha256(shard)
     ):
         raise ValueError(f"owned staging path {name!r} differs from plan")
+
+
+def _validate_published_shard(path: Path, snapshot: FileSnapshot) -> None:
+    current = _hash_regular_file(path, f"published shard {path.name!r}")
+    if (
+        (current.device, current.inode, current.size)
+        != (snapshot.device, snapshot.inode, snapshot.size)
+        or current.sha256 != snapshot.sha256
+    ):
+        raise ValueError(f"published shard {path.name!r} changed after publication")
 
 
 def _validate_staged_output(plan: RankPackPlan, expected: RankManifest) -> None:
@@ -1545,6 +1558,7 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
     output = plan.output_dir
     staging = output / STAGING_MANIFEST_NAME
     _publish_bytes(staging, _manifest_bytes(expected, "complete"))
+    published_shards: list[tuple[Path, FileSnapshot]] = []
     for shard in plan.shards:
         temporary = output / f"{shard.filename}.tmp"
         result = write_shard(shard.tensors, temporary)
@@ -1560,6 +1574,8 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
         if not _path_identifies_snapshot(final, temporary_snapshot):
             raise ValueError(f"written shard {shard.filename!r} changed during publication")
         _fsync_directory(output)
+        _validate_published_shard(final, temporary_snapshot)
+        published_shards.append((final, temporary_snapshot))
     for asset in plan.assets:
         _publish_bytes(output / asset.name, asset.payload)
     _publish_bytes(output / ADAPTER_NAME, plan.adapter_bytes)
@@ -1567,6 +1583,8 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
     _publish_bytes(output / INDEX_NAME, plan.index_bytes)
     _validate_plan_sources(plan)
     _validate_staged_output(plan, expected)
+    for shard_path, shard_snapshot in published_shards:
+        _validate_published_shard(shard_path, shard_snapshot)
     final = output / FINAL_MANIFEST_NAME
     if final.exists() or final.is_symlink():
         raise FileExistsError("refusing to overwrite final rank manifest")

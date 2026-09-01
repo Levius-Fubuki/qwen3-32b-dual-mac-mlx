@@ -726,6 +726,77 @@ def test_shard_publication_rejects_a_replaced_writer_temporary(
     assert marker["plan_id"] == plan.plan_id
 
 
+def test_force_preserves_an_unrelated_shard_temporary_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_write_shard = module.write_shard
+    unrelated = b"unrelated shard temporary\n"
+    collided: Path | None = None
+
+    def collide_before_shard_write(records, path):
+        nonlocal collided
+        collided = Path(path)
+        collided.write_bytes(unrelated)
+        return original_write_shard(records, path)
+
+    monkeypatch.setattr(module, "write_shard", collide_before_shard_write)
+    with pytest.raises(FileExistsError):
+        module.pack_rank(plan)
+
+    assert collided is not None
+    assert collided.read_bytes() == unrelated
+    monkeypatch.setattr(module, "write_shard", original_write_shard)
+    with pytest.raises(ValueError, match="differs|changed|plan-owned"):
+        module.pack_rank(plan, force=True)
+
+    assert collided.read_bytes() == unrelated
+    marker = json.loads((output / module.STAGING_MANIFEST_NAME).read_text())
+    assert marker["plan_id"] == plan.plan_id
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+
+
+def test_shard_replacement_after_directory_fsync_blocks_final_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_fsync = module._fsync_directory
+    shard_name = plan.shards[0].filename
+    displaced = tmp_path / "displaced-fsynced-shard"
+    replacement: bytes | None = None
+    injected = False
+
+    def replace_after_shard_fsync(path: Path) -> None:
+        nonlocal injected, replacement
+        original_fsync(path)
+        shard = path / shard_name
+        if not injected and shard.exists():
+            injected = True
+            changed = bytearray(shard.read_bytes())
+            changed[-1] ^= 0xFF
+            replacement = bytes(changed)
+            os.replace(shard, displaced)
+            shard.write_bytes(replacement)
+
+    monkeypatch.setattr(module, "_fsync_directory", replace_after_shard_fsync)
+    with pytest.raises(ValueError, match="shard.*changed|differs"):
+        module.pack_rank(plan)
+
+    assert injected
+    assert replacement is not None
+    assert (output / shard_name).read_bytes() == replacement
+    assert displaced.is_file()
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+    marker = json.loads((output / module.STAGING_MANIFEST_NAME).read_text())
+    assert marker["plan_id"] == plan.plan_id
+
+
 def test_final_directory_fsync_failure_restores_complete_staging_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
