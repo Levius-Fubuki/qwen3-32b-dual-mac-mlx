@@ -9,7 +9,8 @@ from .contracts import _load_json, _require_exact_keys, _require_int, _require_s
 
 
 VALID_QUANTIZATION_BITS = frozenset({3, 4})
-VALID_PREFILL_STEP_SIZES = frozenset({128, 256, 512})
+VALID_PREFILL_STEP_SIZES = frozenset({32, 64})
+VALID_CONTEXT_LIMITS = frozenset({2048, 8192})
 MODEL_LAYER_COUNT = 64
 CANONICAL_CONTEXT_LIMIT = 8192
 
@@ -37,8 +38,8 @@ class Profile:
         if self.prefill_step_size not in VALID_PREFILL_STEP_SIZES:
             raise ValueError(f"prefill_step_size must be one of {sorted(VALID_PREFILL_STEP_SIZES)}")
         _require_int(self.context_limit, "context_limit")
-        if self.context_limit != CANONICAL_CONTEXT_LIMIT:
-            raise ValueError(f"context_limit must be {CANONICAL_CONTEXT_LIMIT}")
+        if self.context_limit not in VALID_CONTEXT_LIMITS:
+            raise ValueError(f"context_limit must be one of {sorted(VALID_CONTEXT_LIMITS)}")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Profile:

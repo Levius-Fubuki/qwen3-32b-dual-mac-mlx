@@ -12,7 +12,7 @@ from typing import Any
 
 ALLOWED_SSH_ENDPOINTS = frozenset({"127.0.0.1", "kelly@169.254.82.82"})
 EXPECTED_RING_HOSTS = (
-    ("127.0.0.1", ("169.254.217.74",)),
+    ("127.0.0.1", ("169.254.252.127",)),
     ("kelly@169.254.82.82", ("169.254.82.82",)),
 )
 EXPECTED_GUARDRAILS = ((0, 10844792422), (1, 12133282611))
@@ -257,7 +257,7 @@ class ClusterConfig:
         if tuple(host.rank for host in self.hosts) != (0, 1):
             raise ValueError("cluster hosts must have unique ranks in order 0, 1")
         expected = (
-            (0, "M3", "127.0.0.1", "169.254.217.74"),
+            (0, "M3", "127.0.0.1", "169.254.252.127"),
             (1, "M4", "kelly@169.254.82.82", "169.254.82.82"),
         )
         actual = tuple((host.rank, host.name, host.ssh, host.thunderbolt_ip) for host in self.hosts)
