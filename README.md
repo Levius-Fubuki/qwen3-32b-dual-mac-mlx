@@ -4,6 +4,8 @@
 - [项目产出报告](DELIVERABLES_REPORT.md)
 - [Hugging Face 4-bit model card](huggingface/4bit/README.md)
 - [Hugging Face 3-bit model card](huggingface/3bit/README.md)
+- [公开 4-bit rank packs](https://huggingface.co/levius-f/Qwen3-32B-4bit-Dual-Mac-MLX)
+- [公开 3-bit rank packs](https://huggingface.co/levius-f/Qwen3-32B-3bit-Dual-Mac-MLX)
 
 This repository retains only the two configurations that completed real two-host inference on the 16 GB M3 MacBook and 16 GB M4 Mac mini.
 

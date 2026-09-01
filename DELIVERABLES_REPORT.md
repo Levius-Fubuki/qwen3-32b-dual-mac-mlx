@@ -4,6 +4,14 @@
 - 交付分支：`feature/qwen3-32b-dual-mac`
 - 交付性质：技术实验产物，不是已上线生产服务
 
+## 公开发布地址
+
+- GitHub 项目仓库：<https://github.com/Levius-Fubuki/qwen3-32b-dual-mac-mlx>
+- Hugging Face 4-bit rank packs：<https://huggingface.co/levius-f/Qwen3-32B-4bit-Dual-Mac-MLX>
+- Hugging Face 3-bit rank packs：<https://huggingface.co/levius-f/Qwen3-32B-3bit-Dual-Mac-MLX>
+
+Hugging Face 仅发布双机运行所需的最终 rank-local packs；未重复上传上游完整原始模型。
+
 ## 1. 交付概览
 
 本次交付保留两个最终模型方案、一套 Qwen3 流水线适配器、一套无反量化 rank pack 工具、最终配置、benchmark runner 和复现文档。
@@ -26,7 +34,7 @@
 - 分支：`feature/qwen3-32b-dual-mac`
 - 长上下文优化检查点：`557e672`
 - 清理检查点：`a8cb1ae`
-- 主分支仍停留在 `1fc0e92`，尚未合并本功能分支。
+- GitHub 公开仓库的 `main` 分支由本功能分支发布。
 
 ### 2.2 核心文件
 
