@@ -245,6 +245,31 @@ def test_plan_is_frozen_complete_deterministic_and_never_splits_units(tmp_path: 
         dataclasses.replace(first, shards=(changed_shard, *first.shards[1:]))
 
 
+@pytest.mark.parametrize("mutation", ["missing", "extra", "mismatch", "order"])
+def test_manifest_shard_units_exactly_match_tensor_derived_units(mutation: str) -> None:
+    module = rank_pack()
+    shard = module.ManifestShard(
+        "model-00001-of-00001.safetensors",
+        (
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        ),
+        ("model.embed_tokens", "model.layers.0"),
+        2,
+    )
+    if mutation == "missing":
+        changed = shard.module_units[:-1]
+    elif mutation == "extra":
+        changed = (*shard.module_units, "model.layers.1")
+    elif mutation == "mismatch":
+        changed = ("model.embed_tokens", "model.layers.1")
+    else:
+        changed = tuple(reversed(shard.module_units))
+
+    with pytest.raises(ValueError, match="module unit|units"):
+        dataclasses.replace(shard, module_units=changed)
+
+
 def test_oversized_unit_fails_during_planning_without_writing_output(tmp_path: Path) -> None:
     module = rank_pack()
     source = _source_model(tmp_path / "source")
@@ -462,11 +487,13 @@ def test_interruption_leaves_matching_staging_marker_and_no_final_manifest(
         original = module._publish_bytes
 
         def fail_boundary(path, payload, *, replace=False):
+            if boundary == "manifest" and path.name == module.STAGING_MANIFEST_NAME:
+                original(path, payload, replace=replace)
+                raise failure
             if (
                 (boundary == "asset" and path.name == "tokenizer.json")
                 or (boundary == "config" and path.name == "config.json")
                 or (boundary == "index" and path.name == "model.safetensors.index.json")
-                or (boundary == "manifest" and path.name == module.STAGING_MANIFEST_NAME and replace)
             ):
                 raise failure
             return original(path, payload, replace=replace)
@@ -508,6 +535,195 @@ def test_matching_force_marker_recovers_only_owned_partial_files(tmp_path: Path,
     manifest = module.pack_rank(plan, force=True)
     assert manifest.plan_id == plan.plan_id
     assert (output / module.FINAL_MANIFEST_NAME).is_file()
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "README.md",
+        "config.json",
+        "model-00001-of-00001.safetensors",
+        "model.safetensors.index.json",
+        "qwen3_pipeline.py",
+        "tokenizer.json",
+        "rank-manifest.json.staging",
+    ],
+)
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_force_cleanup_keeps_bound_marker_until_every_owned_artifact_is_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+    timing: str,
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_rename = module._rename_no_replace
+
+    def stop_before_final(source_path, destination_path) -> None:
+        if Path(destination_path).name == module.FINAL_MANIFEST_NAME:
+            raise RuntimeError("leave complete staging output")
+        original_rename(source_path, destination_path)
+
+    monkeypatch.setattr(module, "_rename_no_replace", stop_before_final)
+    with pytest.raises(RuntimeError, match="leave complete staging output"):
+        module.pack_rank(plan)
+    monkeypatch.setattr(module, "_rename_no_replace", original_rename)
+
+    target = output / target_name
+    assert target.is_file()
+    original_unlink = os.unlink
+    failure = KeyboardInterrupt(f"cleanup {timing} {target_name}")
+
+    def interrupt_cleanup(path) -> None:
+        if Path(path) == target:
+            if timing == "after":
+                original_unlink(path)
+            raise failure
+        original_unlink(path)
+
+    monkeypatch.setattr(os, "unlink", interrupt_cleanup)
+    with pytest.raises(KeyboardInterrupt, match=f"cleanup {timing}") as caught:
+        module.pack_rank(plan, force=True)
+
+    assert caught.value is failure
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+    remaining = {entry.name for entry in os.scandir(output)}
+    if target_name == module.STAGING_MANIFEST_NAME and timing == "after":
+        assert remaining == set()
+    else:
+        marker = json.loads((output / module.STAGING_MANIFEST_NAME).read_text())
+        assert marker["plan_id"] == plan.plan_id
+        assert marker["state"] == "complete"
+
+    monkeypatch.setattr(os, "unlink", original_unlink)
+    manifest = module.pack_rank(plan, force=True)
+    assert manifest.plan_id == plan.plan_id
+
+
+def test_force_cleanup_preserves_an_identity_replacement_and_matching_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_rename = module._rename_no_replace
+
+    def stop_before_final(source_path, destination_path) -> None:
+        if Path(destination_path).name == module.FINAL_MANIFEST_NAME:
+            raise RuntimeError("leave complete staging output")
+        original_rename(source_path, destination_path)
+
+    monkeypatch.setattr(module, "_rename_no_replace", stop_before_final)
+    with pytest.raises(RuntimeError, match="leave complete staging output"):
+        module.pack_rank(plan)
+    monkeypatch.setattr(module, "_rename_no_replace", original_rename)
+
+    target = output / "config.json"
+    displaced = output / "displaced-tool-config"
+    unrelated = b"unrelated replacement config\n"
+    original_validate = module._validate_snapshot
+    injected = False
+
+    def replace_after_binding(snapshot, label) -> None:
+        nonlocal injected
+        if not injected and snapshot.path == target:
+            injected = True
+            os.replace(target, displaced)
+            target.write_bytes(unrelated)
+        original_validate(snapshot, label)
+
+    monkeypatch.setattr(module, "_validate_snapshot", replace_after_binding)
+    with pytest.raises(ValueError, match="changed"):
+        module.pack_rank(plan, force=True)
+
+    assert target.read_bytes() == unrelated
+    assert displaced.is_file()
+    marker = json.loads((output / module.STAGING_MANIFEST_NAME).read_text())
+    assert marker["plan_id"] == plan.plan_id
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "rank-manifest.json.staging",
+        "model-00001-of-00001.safetensors",
+        "README.md",
+        "qwen3_pipeline.py",
+        "config.json",
+        "model.safetensors.index.json",
+    ],
+)
+def test_nonfinal_publication_collision_preserves_unrelated_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_rename = module._rename_no_replace
+    unrelated = f"unrelated {target_name}\n".encode()
+
+    def collide_before_publication(source_path, destination_path) -> None:
+        if Path(destination_path).name == target_name:
+            Path(destination_path).write_bytes(unrelated)
+        original_rename(source_path, destination_path)
+
+    monkeypatch.setattr(module, "_rename_no_replace", collide_before_publication)
+    with pytest.raises(FileExistsError):
+        module.pack_rank(plan)
+
+    assert (output / target_name).read_bytes() == unrelated
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+    if target_name != module.STAGING_MANIFEST_NAME:
+        marker = json.loads((output / module.STAGING_MANIFEST_NAME).read_text())
+        assert marker["plan_id"] == plan.plan_id
+        assert marker["state"] == "complete"
+        monkeypatch.setattr(module, "_rename_no_replace", original_rename)
+        with pytest.raises(ValueError, match="differs|changed"):
+            module.pack_rank(plan, force=True)
+        assert (output / target_name).read_bytes() == unrelated
+        assert (output / module.STAGING_MANIFEST_NAME).is_file()
+
+
+def test_shard_publication_rejects_a_replaced_writer_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_rename = module._rename_no_replace
+    displaced = output / "displaced-tool-shard"
+    injected = False
+
+    def replace_shard_temporary(source_path, destination_path) -> None:
+        nonlocal injected
+        source_value = Path(source_path)
+        destination_value = Path(destination_path)
+        if not injected and destination_value.suffix == ".safetensors":
+            injected = True
+            payload = bytearray(source_value.read_bytes())
+            payload[-1] ^= 0xFF
+            os.replace(source_value, displaced)
+            source_value.write_bytes(payload)
+        original_rename(source_path, destination_path)
+
+    monkeypatch.setattr(module, "_rename_no_replace", replace_shard_temporary)
+    with pytest.raises(ValueError, match="shard.*changed"):
+        module.pack_rank(plan)
+
+    assert injected
+    assert displaced.is_file()
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+    marker = json.loads((output / module.STAGING_MANIFEST_NAME).read_text())
+    assert marker["plan_id"] == plan.plan_id
 
 
 def test_final_directory_fsync_failure_restores_complete_staging_marker(
@@ -662,7 +878,8 @@ def test_final_publication_restore_failure_preserves_primary_and_removes_owned_f
 
     def publish_then_fail(source_path, destination_path) -> None:
         original_rename(source_path, destination_path)
-        raise primary
+        if Path(destination_path).name == module.FINAL_MANIFEST_NAME:
+            raise primary
 
     def fail_restore(source_path, destination_path) -> None:
         source_name = Path(source_path).name
@@ -734,7 +951,8 @@ def test_final_publication_atomically_refuses_a_concurrent_destination(
     original_rename = module._rename_no_replace
 
     def create_final_before_rename(source_path, destination_path) -> None:
-        Path(destination_path).write_bytes(unrelated)
+        if Path(destination_path).name == module.FINAL_MANIFEST_NAME:
+            Path(destination_path).write_bytes(unrelated)
         original_rename(source_path, destination_path)
 
     monkeypatch.setattr(module, "_rename_no_replace", create_final_before_rename)

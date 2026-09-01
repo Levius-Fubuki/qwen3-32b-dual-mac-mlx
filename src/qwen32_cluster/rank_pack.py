@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+import struct
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -437,6 +438,11 @@ class ManifestShard:
             raise ValueError("manifest module_units must be a non-empty tuple")
         if len(set(self.module_units)) != len(self.module_units):
             raise ValueError("manifest module_units must be unique")
+        derived_units = {module_unit(key) for key in self.tensor_keys}
+        if set(self.module_units) != derived_units:
+            raise ValueError("manifest module units must exactly match tensor-derived units")
+        if self.module_units != tuple(sorted(derived_units, key=_unit_sort_key)):
+            raise ValueError("manifest module units must be in stable canonical order")
         expected_order = tuple(
             key
             for unit in self.module_units
@@ -669,8 +675,20 @@ def _read_regular(path: Path, label: str) -> tuple[bytes, FileSnapshot]:
             chunks.append(chunk)
             remaining -= len(chunk)
         after = os.fstat(fd)
-        identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
-        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
             raise ValueError(f"{label} changed while reading")
     finally:
         os.close(fd)
@@ -1045,28 +1063,36 @@ def _fsync_directory(path: Path) -> None:
 def _publish_bytes(path: Path, payload: bytes, *, replace: bool = False) -> None:
     if not isinstance(payload, bytes):
         raise ValueError("published payload must be bytes")
+    if replace:
+        raise ValueError("published metadata must never replace an existing destination")
     temporary = path.with_name(path.name + ".tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     fd: int | None = None
+    temporary_snapshot: FileSnapshot | None = None
     try:
         fd = os.open(temporary, flags, 0o600)
+        temporary_snapshot = _snapshot_from_stat(temporary, os.fstat(fd), None)
         _write_all(fd, payload)
         os.fsync(fd)
         os.close(fd)
         fd = None
-        if not replace and path.exists():
-            raise FileExistsError(f"refusing to overwrite {path.name}")
-        os.replace(temporary, path)
+        _rename_no_replace(temporary, path)
         _fsync_directory(path.parent)
-    except BaseException:
+    except BaseException as error:
         if fd is not None:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except BaseException as close_error:
+                error.add_note(f"failed to close metadata temporary: {close_error}")
         try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+            if temporary_snapshot is not None and _path_identifies_snapshot(
+                temporary, temporary_snapshot
+            ):
+                os.unlink(temporary)
+        except BaseException as cleanup_error:
+            error.add_note(f"failed to remove metadata temporary: {cleanup_error}")
         raise
 
 
@@ -1113,6 +1139,84 @@ def _expected_shard_geometry(shard: PlannedShard) -> tuple[int, int, int]:
     header_length = len(compact) + (-len(compact) % 8)
     data_start = 8 + header_length
     return header_length, data_start, data_start + shard.payload_bytes
+
+
+def _hash_regular_file(path: Path, label: str) -> FileSnapshot:
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"{label} must be a regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError(f"{label} changed while opening")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(fd)
+        identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ValueError(f"{label} changed while hashing")
+    finally:
+        os.close(fd)
+    return _snapshot_from_stat(path, opened, digest.hexdigest())
+
+
+def _planned_shard_sha256(shard: PlannedShard) -> str:
+    header: dict[str, dict[str, Any]] = {}
+    offset = 0
+    ordered = tuple(sorted(shard.tensors, key=lambda item: item.name))
+    for record in ordered:
+        end = offset + record.nbytes
+        header[record.name] = {
+            "data_offsets": [offset, end],
+            "dtype": record.dtype,
+            "shape": list(record.shape),
+        }
+        offset = end
+    encoded = json.dumps(
+        header, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    digest = hashlib.sha256(struct.pack("<Q", len(encoded)) + encoded)
+    source_fds: dict[Path, int] = {}
+    try:
+        for record in ordered:
+            fd = source_fds.get(record.source_file)
+            if fd is None:
+                fd = os.open(record.source_file, os.O_RDONLY)
+                source_fds[record.source_file] = fd
+            position = record.start
+            remaining = record.nbytes
+            while remaining:
+                chunk = os.pread(fd, min(1 << 20, remaining), position)
+                if not chunk:
+                    raise ValueError(f"tensor {record.name!r} source was truncated")
+                digest.update(chunk)
+                position += len(chunk)
+                remaining -= len(chunk)
+    finally:
+        for fd in source_fds.values():
+            os.close(fd)
+    return digest.hexdigest()
 
 
 def _expected_shard_descriptors(
@@ -1196,6 +1300,49 @@ def _validate_payload_files(plan: RankPackPlan, expected_names: set[str]) -> Non
         actual_keys.update(keys)
     if actual_keys != set(plan.selected_keys):
         raise ValueError("rank pack tensor coverage is incomplete")
+
+
+def _validate_recovery_artifact(
+    plan: RankPackPlan, name: str, snapshot: FileSnapshot
+) -> None:
+    _validate_snapshot(snapshot, f"owned staging path {name!r}")
+    if name.endswith(".tmp"):
+        return
+    expected_payloads = {
+        **{asset.name: asset.payload for asset in plan.assets},
+        ADAPTER_NAME: plan.adapter_bytes,
+        CONFIG_NAME: plan.config_bytes,
+        INDEX_NAME: plan.index_bytes,
+    }
+    if name in expected_payloads:
+        payload, current = _read_regular(snapshot.path, f"owned staging path {name!r}")
+        current_identity = (
+            current.device,
+            current.inode,
+            current.size,
+            current.mtime_ns,
+            current.ctime_ns,
+        )
+        snapshot_identity = (
+            snapshot.device,
+            snapshot.inode,
+            snapshot.size,
+            snapshot.mtime_ns,
+            snapshot.ctime_ns,
+        )
+        if current_identity != snapshot_identity or payload != expected_payloads[name]:
+            raise ValueError(f"owned staging path {name!r} differs from plan")
+        return
+    shard = next((item for item in plan.shards if item.filename == name), None)
+    if shard is None:
+        raise ValueError(f"owned staging path {name!r} is not plan-owned")
+    current = _hash_regular_file(snapshot.path, f"owned staging path {name!r}")
+    if (
+        (current.device, current.inode, current.size, current.mtime_ns, current.ctime_ns)
+        != (snapshot.device, snapshot.inode, snapshot.size, snapshot.mtime_ns, snapshot.ctime_ns)
+        or current.sha256 != _planned_shard_sha256(shard)
+    ):
+        raise ValueError(f"owned staging path {name!r} differs from plan")
 
 
 def _validate_staged_output(plan: RankPackPlan, expected: RankManifest) -> None:
@@ -1348,7 +1495,7 @@ def _prepare_output(plan: RankPackPlan, expected: RankManifest, force: bool) -> 
     staging = output / STAGING_MANIFEST_NAME
     if not staging.exists() or staging.is_symlink():
         raise ValueError("force requires a matching regular staging marker")
-    marker_payload, _ = _read_regular(staging, "staging rank manifest")
+    marker_payload, marker_snapshot = _read_regular(staging, "staging rank manifest")
     marker = _load_json_bytes(marker_payload, STAGING_MANIFEST_NAME)
     expected_value = expected.to_dict()
     marker_state = marker.get("state")
@@ -1357,17 +1504,30 @@ def _prepare_output(plan: RankPackPlan, expected: RankManifest, force: bool) -> 
     expected_value["state"] = marker_state
     if marker != expected_value:
         raise ValueError("staging marker does not match this plan")
-    allowed = set(expected.managed_files)
+    allowed = set(expected.managed_files) - {FINAL_MANIFEST_NAME}
     unknown = entries - allowed
     if unknown:
         raise ValueError(f"staging directory contains unknown files: {sorted(unknown)}")
+    content_snapshots: dict[str, FileSnapshot] = {}
     for name in sorted(entries):
         path = output / name
         value = os.lstat(path)
         if not stat.S_ISREG(value.st_mode):
             raise ValueError(f"owned staging path {name!r} is not a regular file")
-    for name in sorted(entries):
-        os.unlink(output / name)
+        if name != STAGING_MANIFEST_NAME:
+            content_snapshots[name] = _snapshot_from_stat(path, value, None)
+    _validate_snapshot(marker_snapshot, "staging rank manifest")
+    for name, snapshot in content_snapshots.items():
+        _validate_snapshot(marker_snapshot, "staging rank manifest")
+        _validate_recovery_artifact(plan, name, snapshot)
+        os.unlink(snapshot.path)
+    _validate_snapshot(marker_snapshot, "staging rank manifest")
+    remaining = {entry.name for entry in os.scandir(output)}
+    if remaining != {STAGING_MANIFEST_NAME}:
+        raise ValueError("staging directory changed during forced cleanup")
+    _fsync_directory(output)
+    _validate_snapshot(marker_snapshot, "staging rank manifest")
+    os.unlink(staging)
     _fsync_directory(output)
     return None
 
@@ -1384,14 +1544,21 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
         return existing
     output = plan.output_dir
     staging = output / STAGING_MANIFEST_NAME
-    _publish_bytes(staging, _manifest_bytes(expected, "staging"))
+    _publish_bytes(staging, _manifest_bytes(expected, "complete"))
     for shard in plan.shards:
         temporary = output / f"{shard.filename}.tmp"
-        write_shard(shard.tensors, temporary)
+        result = write_shard(shard.tensors, temporary)
+        temporary_snapshot = _hash_regular_file(temporary, f"shard {shard.filename!r}")
+        if (
+            result.path != temporary
+            or result.file_size != temporary_snapshot.size
+            or result.sha256 != temporary_snapshot.sha256
+        ):
+            raise ValueError(f"written shard {shard.filename!r} changed before publication")
         final = output / shard.filename
-        if final.exists() or final.is_symlink():
-            raise FileExistsError(f"refusing to overwrite {shard.filename}")
-        os.replace(temporary, final)
+        _rename_no_replace(temporary, final)
+        if not _path_identifies_snapshot(final, temporary_snapshot):
+            raise ValueError(f"written shard {shard.filename!r} changed during publication")
         _fsync_directory(output)
     for asset in plan.assets:
         _publish_bytes(output / asset.name, asset.payload)
@@ -1399,7 +1566,6 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
     _publish_bytes(output / CONFIG_NAME, plan.config_bytes)
     _publish_bytes(output / INDEX_NAME, plan.index_bytes)
     _validate_plan_sources(plan)
-    _publish_bytes(staging, _manifest_bytes(expected, "complete"), replace=True)
     _validate_staged_output(plan, expected)
     final = output / FINAL_MANIFEST_NAME
     if final.exists() or final.is_symlink():
