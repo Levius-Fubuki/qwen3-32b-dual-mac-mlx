@@ -1,5 +1,8 @@
 # Qwen3-32B Dual-Mac Final Configurations
 
+- [完整实验报告](EXPERIMENT_REPORT.md)
+- [项目产出报告](DELIVERABLES_REPORT.md)
+
 This repository retains only the two configurations that completed real two-host inference on the 16 GB M3 MacBook and 16 GB M4 Mac mini.
 
 ## Cluster
