@@ -564,9 +564,9 @@ def test_final_manifest_publication_rolls_back_only_its_renamed_inode(
     unknown = output / "unknown-user-file.txt"
 
     if boundary in {"post-rename", "replace"}:
-        original_replace = os.replace
+        original_rename = module._rename_no_replace
 
-        def fail_final_replace(source_path, destination_path) -> None:
+        def fail_final_rename(source_path, destination_path) -> None:
             source_value = Path(source_path)
             destination_value = Path(destination_path)
             if (
@@ -574,12 +574,12 @@ def test_final_manifest_publication_rolls_back_only_its_renamed_inode(
                 and destination_value.name == module.FINAL_MANIFEST_NAME
             ):
                 if boundary == "post-rename":
-                    original_replace(source_path, destination_path)
+                    original_rename(source_path, destination_path)
                 unknown.write_text("preserve me", encoding="utf-8")
                 raise failure
-            original_replace(source_path, destination_path)
+            original_rename(source_path, destination_path)
 
-        monkeypatch.setattr(os, "replace", fail_final_replace)
+        monkeypatch.setattr(module, "_rename_no_replace", fail_final_rename)
     else:
         original_fsync = module._fsync_directory
         injected = False
@@ -607,6 +607,196 @@ def test_final_manifest_publication_rolls_back_only_its_renamed_inode(
     assert unknown.read_text() == "preserve me"
 
 
+def test_final_publication_rollback_inspection_failure_does_not_mask_primary_or_leave_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
+    primary = KeyboardInterrupt("publication interrupted")
+    original_rename = module._rename_no_replace
+    original_exists = Path.exists
+
+    def publish_then_fail(source_path, destination_path) -> None:
+        original_rename(source_path, destination_path)
+        if (
+            Path(source_path).name == module.STAGING_MANIFEST_NAME
+            and Path(destination_path).name == module.FINAL_MANIFEST_NAME
+        ):
+            raise primary
+
+    def fail_rollback_staging_inspection(path: Path) -> bool:
+        if (
+            path.name == module.STAGING_MANIFEST_NAME
+            and original_exists(path.parent / module.FINAL_MANIFEST_NAME)
+        ):
+            raise OSError("rollback staging inspection failed")
+        return original_exists(path)
+
+    monkeypatch.setattr(module, "_rename_no_replace", publish_then_fail)
+    monkeypatch.setattr(Path, "exists", fail_rollback_staging_inspection)
+
+    with pytest.raises(KeyboardInterrupt, match="publication interrupted") as caught:
+        module.pack_rank(plan)
+
+    assert caught.value is primary
+    assert any(
+        "rollback staging inspection failed" in note
+        for note in getattr(caught.value, "__notes__", ())
+    )
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+
+
+def test_final_publication_restore_failure_preserves_primary_and_removes_owned_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
+    primary = OSError("publication failed after rename")
+    restore_failure = OSError("restore rename failed")
+    original_rename = module._rename_no_replace
+    original_replace = os.replace
+
+    def publish_then_fail(source_path, destination_path) -> None:
+        original_rename(source_path, destination_path)
+        raise primary
+
+    def fail_restore(source_path, destination_path) -> None:
+        source_name = Path(source_path).name
+        destination_name = Path(destination_path).name
+        if (
+            source_name == module.FINAL_MANIFEST_NAME
+            and destination_name == module.STAGING_MANIFEST_NAME
+        ):
+            raise restore_failure
+        original_replace(source_path, destination_path)
+
+    monkeypatch.setattr(module, "_rename_no_replace", publish_then_fail)
+    monkeypatch.setattr(os, "replace", fail_restore)
+
+    with pytest.raises(OSError, match="publication failed after rename") as caught:
+        module.pack_rank(plan)
+
+    assert caught.value is primary
+    assert any(
+        "restore rename failed" in note for note in getattr(caught.value, "__notes__", ())
+    )
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
+    assert not (output / module.STAGING_MANIFEST_NAME).exists()
+
+
+def test_successful_final_manifest_publication_is_the_last_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
+    original_rename = module._rename_no_replace
+    original_fsync_directory = module._fsync_directory
+    final_events: list[str] = []
+
+    def track_final_rename(source_path, destination_path) -> None:
+        original_rename(source_path, destination_path)
+        if (
+            Path(source_path).name == module.STAGING_MANIFEST_NAME
+            and Path(destination_path).name == module.FINAL_MANIFEST_NAME
+        ):
+            final_events.append("rename")
+
+    def track_final_fsync(path: Path) -> None:
+        original_fsync_directory(path)
+        if (path / module.FINAL_MANIFEST_NAME).exists():
+            final_events.append("fsync")
+
+    monkeypatch.setattr(module, "_rename_no_replace", track_final_rename)
+    monkeypatch.setattr(module, "_fsync_directory", track_final_fsync)
+
+    manifest = module.pack_rank(plan)
+
+    assert manifest.plan_id == plan.plan_id
+    assert final_events == ["rename", "fsync"]
+    assert (output / module.FINAL_MANIFEST_NAME).is_file()
+    assert not (output / module.STAGING_MANIFEST_NAME).exists()
+
+
+def test_final_publication_atomically_refuses_a_concurrent_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
+    unrelated = b"concurrent final replacement\n"
+    original_rename = module._rename_no_replace
+
+    def create_final_before_rename(source_path, destination_path) -> None:
+        Path(destination_path).write_bytes(unrelated)
+        original_rename(source_path, destination_path)
+
+    monkeypatch.setattr(module, "_rename_no_replace", create_final_before_rename)
+
+    with pytest.raises(FileExistsError):
+        module.pack_rank(plan)
+
+    assert (output / module.FINAL_MANIFEST_NAME).read_bytes() == unrelated
+    marker = json.loads((output / module.STAGING_MANIFEST_NAME).read_text())
+    assert marker["state"] == "complete"
+
+
+def test_final_publication_uses_an_atomic_rename_not_a_hard_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
+
+    def reject_hard_link(*args, **kwargs) -> None:
+        raise AssertionError("final publication must not expose a dual-link state")
+
+    monkeypatch.setattr(os, "link", reject_hard_link)
+
+    manifest = module.pack_rank(plan)
+
+    assert manifest.plan_id == plan.plan_id
+    assert (output / module.FINAL_MANIFEST_NAME).is_file()
+    assert not (output / module.STAGING_MANIFEST_NAME).exists()
+
+
+def test_final_publication_detects_replacement_during_directory_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
+    original_fsync = module._fsync_directory
+    displaced = output / "displaced-tool-manifest"
+    unrelated = b"replacement during final fsync\n"
+    injected = False
+
+    def replace_during_final_fsync(path: Path) -> None:
+        nonlocal injected
+        original_fsync(path)
+        final = path / module.FINAL_MANIFEST_NAME
+        if not injected and final.exists():
+            injected = True
+            os.replace(final, displaced)
+            final.write_bytes(unrelated)
+
+    monkeypatch.setattr(module, "_fsync_directory", replace_during_final_fsync)
+
+    with pytest.raises(RuntimeError, match="identity"):
+        module.pack_rank(plan)
+
+    assert (output / module.FINAL_MANIFEST_NAME).read_bytes() == unrelated
+    assert displaced.is_file()
+
+
 def test_final_publication_detects_and_preserves_an_unrelated_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -614,20 +804,20 @@ def test_final_publication_detects_and_preserves_an_unrelated_replacement(
     source = _source_model(tmp_path / "source")
     output = tmp_path / "output"
     plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=32)
-    original_replace = os.replace
+    original_rename = module._rename_no_replace
     displaced = output / "displaced-tool-manifest"
     unrelated = b"unrelated replacement\n"
 
     def replace_then_substitute(source_path, destination_path) -> None:
-        original_replace(source_path, destination_path)
+        original_rename(source_path, destination_path)
         if (
             Path(source_path).name == module.STAGING_MANIFEST_NAME
             and Path(destination_path).name == module.FINAL_MANIFEST_NAME
         ):
-            original_replace(destination_path, displaced)
+            os.replace(destination_path, displaced)
             Path(destination_path).write_bytes(unrelated)
 
-    monkeypatch.setattr(os, "replace", replace_then_substitute)
+    monkeypatch.setattr(module, "_rename_no_replace", replace_then_substitute)
     with pytest.raises(RuntimeError, match="identity"):
         module.pack_rank(plan)
 

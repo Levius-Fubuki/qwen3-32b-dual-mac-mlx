@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
 import stat
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -1231,6 +1234,40 @@ def _path_identifies_snapshot(path: Path, snapshot: FileSnapshot) -> bool:
     )
 
 
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    """Move a regular file while atomically refusing an existing destination."""
+
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin":
+        rename = library.renamex_np
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, destination_bytes, 0x00000004)
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError as exc:
+            raise OSError(
+                errno.ENOTSUP, "atomic no-replace rename is unavailable"
+            ) from exc
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_bytes, -100, destination_bytes, 0x00000001)
+    else:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def _unlink_snapshot_path(path: Path, snapshot: FileSnapshot, error: BaseException) -> None:
     if not _path_identifies_snapshot(path, snapshot):
         return
@@ -1246,26 +1283,39 @@ def _rollback_final_manifest(
     staging_snapshot: FileSnapshot,
     error: BaseException,
 ) -> None:
+    final_is_owned = False
     try:
         final_is_owned = _path_identifies_snapshot(final, staging_snapshot)
-        staging_exists = staging.exists() or staging.is_symlink()
-        if final_is_owned and not staging_exists:
-            try:
-                os.replace(final, staging)
-            except BaseException as rollback_error:
-                error.add_note(
-                    f"failed to restore the complete staging manifest: {rollback_error}"
-                )
+    except BaseException as inspection_error:
+        error.add_note(f"failed to inspect final manifest rollback state: {inspection_error}")
 
+    staging_exists = True
+    try:
+        staging_exists = staging.exists() or staging.is_symlink()
+    except BaseException as inspection_error:
+        error.add_note(f"failed to inspect staging manifest rollback state: {inspection_error}")
+
+    if final_is_owned and not staging_exists:
+        try:
+            os.replace(final, staging)
+        except BaseException as rollback_error:
+            error.add_note(
+                f"failed to restore the complete staging manifest: {rollback_error}"
+            )
+
+    try:
         if _path_identifies_snapshot(final, staging_snapshot):
             _unlink_snapshot_path(final, staging_snapshot, error)
+    except BaseException as inspection_error:
+        error.add_note(f"failed to inspect final manifest cleanup state: {inspection_error}")
+    try:
         if not _path_identifies_snapshot(staging, staging_snapshot):
             error.add_note(
                 "the complete staging manifest could not be restored; no tool-owned "
                 "valid final manifest was retained"
             )
-    except BaseException as rollback_error:
-        error.add_note(f"failed while inspecting final manifest rollback state: {rollback_error}")
+    except BaseException as inspection_error:
+        error.add_note(f"failed to inspect restored staging manifest: {inspection_error}")
     try:
         _fsync_directory(final.parent)
     except BaseException as fsync_error:
@@ -1356,10 +1406,12 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
         raise FileExistsError("refusing to overwrite final rank manifest")
     _, staging_snapshot = _read_regular(staging, "complete staging rank manifest")
     try:
-        os.replace(staging, final)
+        _rename_no_replace(staging, final)
         if not _path_identifies_snapshot(final, staging_snapshot):
             raise RuntimeError("final manifest identity changed during publication")
         _fsync_directory(output)
+        if not _path_identifies_snapshot(final, staging_snapshot):
+            raise RuntimeError("final manifest identity changed during publication fsync")
     except BaseException as error:
         _rollback_final_manifest(staging, final, staging_snapshot, error)
         raise
