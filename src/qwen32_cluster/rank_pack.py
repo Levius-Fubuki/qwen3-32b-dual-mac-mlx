@@ -1060,7 +1060,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _publish_bytes(path: Path, payload: bytes, *, replace: bool = False) -> None:
+def _publish_bytes(path: Path, payload: bytes, *, replace: bool = False) -> FileSnapshot:
     if not isinstance(payload, bytes):
         raise ValueError("published payload must be bytes")
     if replace:
@@ -1078,8 +1078,11 @@ def _publish_bytes(path: Path, payload: bytes, *, replace: bool = False) -> None
         os.fsync(fd)
         os.close(fd)
         fd = None
+        published_snapshot = _hash_regular_file(temporary, f"metadata {path.name!r}")
         _rename_no_replace(temporary, path)
         _fsync_directory(path.parent)
+        _validate_published_file(path, published_snapshot, f"metadata {path.name!r}")
+        return published_snapshot
     except BaseException as error:
         if fd is not None:
             try:
@@ -1348,14 +1351,20 @@ def _validate_recovery_artifact(
         raise ValueError(f"owned staging path {name!r} differs from plan")
 
 
-def _validate_published_shard(path: Path, snapshot: FileSnapshot) -> None:
-    current = _hash_regular_file(path, f"published shard {path.name!r}")
+def _validate_published_file(
+    path: Path, snapshot: FileSnapshot, label: str
+) -> None:
+    current = _hash_regular_file(path, label)
     if (
         (current.device, current.inode, current.size)
         != (snapshot.device, snapshot.inode, snapshot.size)
         or current.sha256 != snapshot.sha256
     ):
-        raise ValueError(f"published shard {path.name!r} changed after publication")
+        raise ValueError(f"{label} changed after publication")
+
+
+def _validate_published_shard(path: Path, snapshot: FileSnapshot) -> None:
+    _validate_published_file(path, snapshot, f"published shard {path.name!r}")
 
 
 def _validate_staged_output(plan: RankPackPlan, expected: RankManifest) -> None:
@@ -1457,7 +1466,7 @@ def _rollback_final_manifest(
 
     if final_is_owned and not staging_exists:
         try:
-            os.replace(final, staging)
+            _rename_no_replace(final, staging)
         except BaseException as rollback_error:
             error.add_note(
                 f"failed to restore the complete staging manifest: {rollback_error}"
@@ -1506,8 +1515,23 @@ def _prepare_output(plan: RankPackPlan, expected: RankManifest, force: bool) -> 
     if not force:
         raise FileExistsError("nonempty destination requires force and a matching staging marker")
     staging = output / STAGING_MANIFEST_NAME
-    if not staging.exists() or staging.is_symlink():
+    if staging.is_symlink():
         raise ValueError("force requires a matching regular staging marker")
+    if not staging.exists():
+        staging_temporary = staging.with_name(staging.name + ".tmp")
+        temporary_payload, temporary_snapshot = _read_regular(
+            staging_temporary, "staging rank manifest temporary"
+        )
+        temporary_marker = _load_json_bytes(
+            temporary_payload, staging_temporary.name
+        )
+        if temporary_marker != expected.to_dict():
+            raise ValueError("staging rank manifest temporary does not match this plan")
+        _rename_no_replace(staging_temporary, staging)
+        if not _path_identifies_snapshot(staging, temporary_snapshot):
+            raise ValueError("staging rank manifest temporary changed during recovery")
+        _fsync_directory(output)
+        entries = {entry.name for entry in os.scandir(output)}
     marker_payload, marker_snapshot = _read_regular(staging, "staging rank manifest")
     marker = _load_json_bytes(marker_payload, STAGING_MANIFEST_NAME)
     expected_value = expected.to_dict()
@@ -1559,6 +1583,7 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
     staging = output / STAGING_MANIFEST_NAME
     _publish_bytes(staging, _manifest_bytes(expected, "complete"))
     published_shards: list[tuple[Path, FileSnapshot]] = []
+    published_metadata: list[tuple[Path, FileSnapshot]] = []
     for shard in plan.shards:
         temporary = output / f"{shard.filename}.tmp"
         result = write_shard(shard.tensors, temporary)
@@ -1577,14 +1602,28 @@ def pack_rank(plan: RankPackPlan, *, force: bool = False) -> RankManifest:
         _validate_published_shard(final, temporary_snapshot)
         published_shards.append((final, temporary_snapshot))
     for asset in plan.assets:
-        _publish_bytes(output / asset.name, asset.payload)
-    _publish_bytes(output / ADAPTER_NAME, plan.adapter_bytes)
-    _publish_bytes(output / CONFIG_NAME, plan.config_bytes)
-    _publish_bytes(output / INDEX_NAME, plan.index_bytes)
+        asset_path = output / asset.name
+        published_metadata.append(
+            (asset_path, _publish_bytes(asset_path, asset.payload))
+        )
+    adapter_path = output / ADAPTER_NAME
+    config_path = output / CONFIG_NAME
+    index_path = output / INDEX_NAME
+    published_metadata.extend(
+        (
+            (adapter_path, _publish_bytes(adapter_path, plan.adapter_bytes)),
+            (config_path, _publish_bytes(config_path, plan.config_bytes)),
+            (index_path, _publish_bytes(index_path, plan.index_bytes)),
+        )
+    )
     _validate_plan_sources(plan)
     _validate_staged_output(plan, expected)
     for shard_path, shard_snapshot in published_shards:
         _validate_published_shard(shard_path, shard_snapshot)
+    for metadata_path, metadata_snapshot in published_metadata:
+        _validate_published_file(
+            metadata_path, metadata_snapshot, f"published metadata {metadata_path.name!r}"
+        )
     final = output / FINAL_MANIFEST_NAME
     if final.exists() or final.is_symlink():
         raise FileExistsError("refusing to overwrite final rank manifest")

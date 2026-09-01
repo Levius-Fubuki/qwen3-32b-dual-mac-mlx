@@ -759,6 +759,42 @@ def test_force_preserves_an_unrelated_shard_temporary_collision(
     assert not (output / module.FINAL_MANIFEST_NAME).exists()
 
 
+def test_force_promotes_a_complete_staging_temporary_but_preserves_foreign_tmp(
+    tmp_path: Path,
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+
+    valid_output = tmp_path / "valid-output"
+    valid_output.mkdir()
+    valid_plan = module.plan_rank_pack(
+        source, valid_output, _profile(), rank=1, max_shard_bytes=512
+    )
+    valid_tmp = valid_output / f"{module.STAGING_MANIFEST_NAME}.tmp"
+    valid_tmp.write_bytes(
+        module._manifest_bytes(module._manifest_for(valid_plan), "complete")
+    )
+
+    manifest = module.pack_rank(valid_plan, force=True)
+    assert manifest.plan_id == valid_plan.plan_id
+    assert not valid_tmp.exists()
+    assert (valid_output / module.FINAL_MANIFEST_NAME).is_file()
+
+    foreign_output = tmp_path / "foreign-output"
+    foreign_output.mkdir()
+    foreign_plan = module.plan_rank_pack(
+        source, foreign_output, _profile(), rank=1, max_shard_bytes=512
+    )
+    foreign_tmp = foreign_output / f"{module.STAGING_MANIFEST_NAME}.tmp"
+    foreign = b"foreign staging temporary\n"
+    foreign_tmp.write_bytes(foreign)
+
+    with pytest.raises(ValueError, match="staging|manifest|plan"):
+        module.pack_rank(foreign_plan, force=True)
+    assert foreign_tmp.read_bytes() == foreign
+    assert not (foreign_output / module.FINAL_MANIFEST_NAME).exists()
+
+
 def test_shard_replacement_after_directory_fsync_blocks_final_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -795,6 +831,39 @@ def test_shard_replacement_after_directory_fsync_blocks_final_manifest(
     assert not (output / module.FINAL_MANIFEST_NAME).exists()
     marker = json.loads((output / module.STAGING_MANIFEST_NAME).read_text())
     assert marker["plan_id"] == plan.plan_id
+
+
+@pytest.mark.parametrize("target_name", ["config.json", "README.md"])
+def test_metadata_replacement_after_staged_validation_blocks_final_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    original_validate = module._validate_staged_output
+    displaced = tmp_path / f"displaced-{target_name}"
+    hostile = f"hostile replacement for {target_name}\n".encode()
+    injected = False
+
+    def replace_after_validation(plan_value, expected) -> None:
+        nonlocal injected
+        original_validate(plan_value, expected)
+        target = output / target_name
+        os.replace(target, displaced)
+        target.write_bytes(hostile)
+        injected = True
+
+    monkeypatch.setattr(module, "_validate_staged_output", replace_after_validation)
+    with pytest.raises(ValueError, match="changed|publication"):
+        module.pack_rank(plan)
+
+    assert injected
+    assert (output / target_name).read_bytes() == hostile
+    assert displaced.is_file()
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
 
 
 def test_final_directory_fsync_failure_restores_complete_staging_marker(
@@ -945,25 +1014,18 @@ def test_final_publication_restore_failure_preserves_primary_and_removes_owned_f
     primary = OSError("publication failed after rename")
     restore_failure = OSError("restore rename failed")
     original_rename = module._rename_no_replace
-    original_replace = os.replace
 
     def publish_then_fail(source_path, destination_path) -> None:
+        if (
+            Path(source_path).name == module.FINAL_MANIFEST_NAME
+            and Path(destination_path).name == module.STAGING_MANIFEST_NAME
+        ):
+            raise restore_failure
         original_rename(source_path, destination_path)
         if Path(destination_path).name == module.FINAL_MANIFEST_NAME:
             raise primary
 
-    def fail_restore(source_path, destination_path) -> None:
-        source_name = Path(source_path).name
-        destination_name = Path(destination_path).name
-        if (
-            source_name == module.FINAL_MANIFEST_NAME
-            and destination_name == module.STAGING_MANIFEST_NAME
-        ):
-            raise restore_failure
-        original_replace(source_path, destination_path)
-
     monkeypatch.setattr(module, "_rename_no_replace", publish_then_fail)
-    monkeypatch.setattr(os, "replace", fail_restore)
 
     with pytest.raises(OSError, match="publication failed after rename") as caught:
         module.pack_rank(plan)
@@ -974,6 +1036,50 @@ def test_final_publication_restore_failure_preserves_primary_and_removes_owned_f
     )
     assert not (output / module.FINAL_MANIFEST_NAME).exists()
     assert not (output / module.STAGING_MANIFEST_NAME).exists()
+
+
+def test_final_rollback_no_clobber_preserves_concurrent_staging_and_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = rank_pack()
+    source = _source_model(tmp_path / "source")
+    output = tmp_path / "output"
+    plan = module.plan_rank_pack(source, output, _profile(), rank=1, max_shard_bytes=512)
+    primary = OSError("final directory fsync failed")
+    concurrent = b"concurrent staging replacement\n"
+    original_fsync = module._fsync_directory
+    original_exists = Path.exists
+    fsync_injected = False
+    staging_injected = False
+
+    def fail_final_fsync(path: Path) -> None:
+        nonlocal fsync_injected
+        if not fsync_injected and (path / module.FINAL_MANIFEST_NAME).exists():
+            fsync_injected = True
+            raise primary
+        original_fsync(path)
+
+    def create_staging_after_absence_check(path: Path) -> bool:
+        nonlocal staging_injected
+        if (
+            not staging_injected
+            and path.name == module.STAGING_MANIFEST_NAME
+            and original_exists(path.parent / module.FINAL_MANIFEST_NAME)
+        ):
+            staging_injected = True
+            path.write_bytes(concurrent)
+            return False
+        return original_exists(path)
+
+    monkeypatch.setattr(module, "_fsync_directory", fail_final_fsync)
+    monkeypatch.setattr(Path, "exists", create_staging_after_absence_check)
+    with pytest.raises(OSError, match="final directory fsync failed") as caught:
+        module.pack_rank(plan)
+
+    assert caught.value is primary
+    assert staging_injected
+    assert (output / module.STAGING_MANIFEST_NAME).read_bytes() == concurrent
+    assert not (output / module.FINAL_MANIFEST_NAME).exists()
 
 
 def test_successful_final_manifest_publication_is_the_last_transaction(
